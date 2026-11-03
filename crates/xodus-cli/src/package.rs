@@ -5,6 +5,20 @@ use xodus::models::packagespc::{PackageDetails, PackageResponse};
 use xodus::models::secrets::Token;
 use xodus::tokens::TokenManager;
 
+/// The build version the authenticated update service is offering.
+///
+/// DisplayCatalog reports every package as version `0`; this field is the one
+/// that changes when Microsoft publishes a new MSIXVC build.
+pub fn available_version(package: &PackageDetails) -> Option<&str> {
+    let version = package.version.trim();
+    let fields: Vec<&str> = version.split('.').take(4).collect();
+    if fields.len() != 4 || fields.iter().any(|field| field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let prefix_len = fields.iter().map(|field| field.len()).sum::<usize>() + 3;
+    Some(&version[..prefix_len])
+}
+
 pub async fn get_content_id(
     client: &reqwest::Client,
     product: String,
@@ -129,4 +143,29 @@ pub async fn get_packages(
         )));
     };
     Ok(package)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_version_comes_from_the_authenticated_package_response() {
+        let package = PackageDetails {
+            package_found: true,
+            content_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            version_id: "version-id".into(),
+            package_files: Vec::new(),
+            version: "1.26.4600.0".into(),
+            hash_of_hashes: None,
+            update_predownload: false,
+            availability_date: "2026-09-08T00:00:00Z".into(),
+        };
+
+        assert_eq!(available_version(&package), Some("1.26.4600.0"));
+
+        let mut with_build_id = package;
+        with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
+        assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
+    }
 }

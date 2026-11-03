@@ -78,6 +78,13 @@ enum SubCommand {
         #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
         title_client_id: Option<String>,
     },
+    #[command(about = "Report the available version for an installed MSIXVC package")]
+    Update {
+        #[arg(help = "ContentId from the installed package header")]
+        content_id: String,
+        #[arg(long, help = "Emit JSON")]
+        json: bool,
+    },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
         product: String,
@@ -327,6 +334,31 @@ async fn main() -> ExitCode {
                 Err(message) => {
                     eprintln!("{message}");
                     std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        SubCommand::Update { content_id, json } => {
+            match package::get_packages(&client, &tokens, content_id.clone()).await {
+                Ok(package) => match package::available_version(&package) {
+                    Some(version) => {
+                        if json {
+                            println!("{}", serde_json::json!({
+                                "content_id": content_id,
+                                "version": version,
+                            }));
+                        } else {
+                            println!("{version}");
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    None => {
+                        eprintln!("update service returned no usable package version");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("could not check for an update: {error}");
+                    ExitCode::FAILURE
                 }
             }
         }
