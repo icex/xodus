@@ -56,7 +56,9 @@ fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
     }
     let mode = r.integer()?;
     let kinds = r.integer()?;
-    let parent = r.text()?;
+    // Store IDs are case-insensitive and the catalog answers in upper case,
+    // so compare and ask in upper case whatever case the title passed.
+    let parent = r.text()?.to_ascii_uppercase();
     let market = r.text()?;
     let language = r.text()?;
     if mode > 1
@@ -79,7 +81,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
     }
     let mut ids = Vec::new();
     for _ in 0..count {
-        let id = r.text()?;
+        let id = r.text()?.to_ascii_uppercase();
         if !valid_id(&id) {
             return Err("invalid catalog ID");
         }
@@ -464,7 +466,10 @@ async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
             .as_array()
             .ok_or("missing catalog products")?;
         for p in products {
-            if !ids.contains(&string(p, "ProductId")) {
+            if !ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(string(p, "ProductId")))
+            {
                 return Err("unexpected catalog product");
             }
             if product(&mut out, p, req)? {
@@ -543,6 +548,27 @@ mod tests {
         req.ids = vec!["9TESTADDON000011".into()];
         assert!(!product(&mut Vec::new(), &p, &req).unwrap());
     }
+    #[test]
+    fn lowercase_store_ids_match_the_catalog_answer() {
+        let mut b = vec![];
+        integer(&mut b, 1);
+        integer(&mut b, 0);
+        integer(&mut b, 31);
+        for s in ["9testparent0", "US", "en-US"] {
+            text(&mut b, s).unwrap();
+        }
+        integer(&mut b, 1);
+        text(&mut b, "9testaddon000010").unwrap();
+        integer(&mut b, 0);
+        let req = parse_request(&b).unwrap();
+        assert_eq!(req.parent, "9TESTPARENT0");
+        assert_eq!(req.ids, ["9TESTADDON000010"]);
+        // The catalog echoes the canonical upper-case ID; the SKU asked for in
+        // lower case still selects its SKU.
+        let p = serde_json::json!({"ProductId":"9TESTADDON00","ProductKind":"Durable","LocalizedProperties":[{"ProductTitle":"t","ProductDescription":"d","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{}},"Availabilities":[{"AvailabilityId":"a","Actions":["Purchase"],"OrderManagementData":{"Price":{"MSRP":1.0,"ListPrice":1.0,"CurrencyCode":"USD"}}}]}]});
+        assert!(product(&mut Vec::new(), &p, &req).unwrap());
+    }
+
     #[test]
     fn request_is_versioned_and_rejects_paths_and_trailing_data() {
         let mut b = vec![];

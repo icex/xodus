@@ -11,7 +11,7 @@
 
 use std::process::ExitCode;
 
-use super::collections::{send, xsts_for};
+use super::collections::{auth_header, send, xsts_for};
 
 const XBOXLIVE_RELYING_PARTY: &str = "http://xboxlive.com";
 const PROFILE_SETTINGS: &str = "https://profile.xboxlive.com/users/me/profile/settings\
@@ -48,7 +48,7 @@ pub async fn describe(
         "gamertag": xsts.gamertag().unwrap_or_default(),
         "xuid": xsts.xuid().unwrap_or_default(),
     });
-    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
+    let auth = auth_header(xsts)?;
 
     let headers = ["x-xbl-contract-version:3".to_string()];
     match send(client, PROFILE_SETTINGS, None, &auth, &headers).await {

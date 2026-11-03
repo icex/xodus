@@ -46,6 +46,18 @@ pub struct XSTSTokenRequest {
     pub title_client_id: String,
 }
 
+/// The optional `<ForceRefresh>true</ForceRefresh>` element of an
+/// `XSTSTokenRequest`: the title's `XUserGetTokenAndSignatureOptions::
+/// ForceRefresh`, sent after a service rejected the token it was given. Read
+/// on its own so that the request type, and every older runtime that never
+/// sends it, stay as they are; an older service ignores the element.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct XSTSRefreshHint {
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
 impl XSTSTokenRequest {
     /// The title this request is on behalf of, when it named one.
     pub fn title(&self) -> Option<(i64, &str)> {

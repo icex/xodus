@@ -43,7 +43,19 @@ pub(crate) async fn xsts_for(
     let Ok(Token::Legacy(user_token)) = tokens.get_user_sts_token() else {
         return Err("no usable user token; run `xodus-cli login` first".into());
     };
-    Ok(xodus::api::xbox::run(client, dev_token, user_token, relying_party).await)
+    // The reporting variant: an account with no Xbox profile, one that needs
+    // consent or a dropped connection is an error for the caller to report,
+    // not a panic that skips its cleanup.
+    xodus::api::xbox::try_run_with_signer(client, dev_token, user_token, relying_party, None).await
+}
+
+/// The `XBL3.0` authorization header for a token, or an error when the token
+/// carries no user claim to build it from.
+pub(crate) fn auth_header(xsts: XstsResponse) -> Result<String, String> {
+    if xsts.user_hash().is_none() {
+        return Err("the Xbox token carries no user claim".into());
+    }
+    Ok(xodus::api::xbox::get_xsts_auth_header(xsts))
 }
 
 /// Mint an XSTS token carrying a title claim for `title_id`.
@@ -148,7 +160,13 @@ pub async fn probe(
     let uhs = xsts.user_hash().unwrap_or_default().to_string();
     let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
     let raw_token = xsts.token.clone();
-    let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
+    let auth = match auth_header(xsts) {
+        Ok(auth) => auth,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let fill = |text: &str| {
         text.replace("{XUID}", &xuid)
             .replace("{UHS}", &uhs)
@@ -372,4 +390,36 @@ pub async fn query(
         );
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(claims: serde_json::Value) -> XstsResponse {
+        serde_json::from_value(serde_json::json!({
+            "NotAfter": "2030-01-01T00:00:00Z",
+            "Token": "synthetic-token",
+            "DisplayClaims": claims
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_token_without_a_user_claim_is_an_error_not_a_panic() {
+        assert!(auth_header(token(serde_json::json!({}))).is_err());
+        assert_eq!(
+            auth_header(token(serde_json::json!({"xui": [{"uhs": "fixture-hash"}]}))).unwrap(),
+            "XBL3.0 x=fixture-hash;synthetic-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_stored_sign_in_is_reported_without_a_network_call() {
+        let tokens = TokenManager::with_memory();
+        let error = xsts_for(&reqwest::Client::new(), &tokens, "http://xboxlive.com")
+            .await
+            .unwrap_err();
+        assert!(error.contains("device token"), "{error}");
+    }
 }

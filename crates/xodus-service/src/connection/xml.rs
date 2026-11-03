@@ -9,7 +9,7 @@ use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::Token;
 use xodus::models::soap;
 use xodus::models::xgameruntime::xuser::{
-    MSATokenRequest, MSATokenResponse, XSTSTokenRequest, XSTSTokenResponse,
+    MSATokenRequest, MSATokenResponse, XSTSRefreshHint, XSTSTokenRequest, XSTSTokenResponse,
 };
 use xodus::proto::xodus::XodusMessageType;
 
@@ -415,6 +415,7 @@ fn licensing_audience_gate(
     ))
 }
 
+#[cfg(test)]
 pub(super) async fn xsts_token(
     context: &mut SimpleContext,
     req: XSTSTokenRequest,
@@ -426,6 +427,52 @@ pub(super) async fn xsts_token_for(
     context: &mut SimpleContext,
     req: XSTSTokenRequest,
     caller: Caller,
+) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+    xsts_token_with(context, req, caller, false).await
+}
+
+/// The runtime's `ForceRefresh` flag, read from the same request. A title sets
+/// it after a service rejected the token it was given, and only a new token
+/// helps then.
+fn force_refresh_requested(xml: &str) -> bool {
+    quick_xml::de::from_str::<XSTSRefreshHint>(xml)
+        .map(|hint| hint.force_refresh)
+        .unwrap_or(false)
+}
+
+/// When each cache key was last re-minted on a title's request. A title that
+/// asks for a refresh on every call would otherwise run the whole sign-in
+/// chain per request; within this window it gets the token just minted.
+static FORCED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+const FORCED_REFRESH_INTERVAL: i64 = 30;
+
+/// The cached token for `key`, unless it is about to expire or the title asked
+/// for a new one and none was minted on request in the last
+/// `FORCED_REFRESH_INTERVAL` seconds.
+fn cached_token_for(key: &str, now: i64, force_refresh: bool) -> Option<CachedToken> {
+    if force_refresh {
+        let mut forced = FORCED.lock().ok()?;
+        if forced
+            .get(key)
+            .is_none_or(|at| now - *at >= FORCED_REFRESH_INTERVAL)
+        {
+            forced.insert(key.to_owned(), now);
+            return None;
+        }
+    }
+    XSTS_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.get(key).cloned())
+        .filter(|c| c.expiry > now + 60)
+}
+
+async fn xsts_token_with(
+    context: &mut SimpleContext,
+    req: XSTSTokenRequest,
+    caller: Caller,
+    force_refresh: bool,
 ) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     tracing::debug!("XSTS token request for {}", req.url);
 
@@ -505,12 +552,7 @@ pub(super) async fn xsts_token_for(
     }
     let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
     let now = chrono::Utc::now().timestamp();
-    if let Some(hit) = XSTS_CACHE
-        .lock()
-        .ok()
-        .and_then(|c| c.get(&cache_key).cloned())
-        .filter(|c| c.expiry > now + 60)
-    {
+    if let Some(hit) = cached_token_for(&cache_key, now, force_refresh) {
         let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
         let payload = XSTSTokenResponse {
             token: hit.token,
@@ -744,8 +786,10 @@ pub async fn parse_message(
             }
         }
         XodusMessageType::XstsTokenRequest => {
-            let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
-            let payload = xsts_token(context, req).await?;
+            let xml = std::str::from_utf8(&buffer)?;
+            let req = quick_xml::de::from_str::<XSTSTokenRequest>(xml)?;
+            let payload =
+                xsts_token_with(context, req, Caller::Title, force_refresh_requested(xml)).await?;
             Ok(quick_xml::se::to_string(&payload)?.into_bytes())
         }
         XodusMessageType::LicenseTokenRequest => {
@@ -774,12 +818,76 @@ pub async fn parse_message(
 mod tests;
 
 #[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    #[test]
+    fn the_force_refresh_flag_is_optional_on_the_wire() {
+        let request = |extra: &str| {
+            format!(
+                "<XSTSTokenRequest><Url>https://xboxlive.com</Url><RelyingParty></RelyingParty><Method>GET</Method>{extra}<BodyBase64></BodyBase64></XSTSTokenRequest>"
+            )
+        };
+        assert!(!force_refresh_requested(&request("")));
+        assert!(force_refresh_requested(&request(
+            "<ForceRefresh>true</ForceRefresh>"
+        )));
+        assert!(force_refresh_requested(&request(
+            "<ForceRefresh>1</ForceRefresh>"
+        )));
+        assert!(!force_refresh_requested(&request(
+            "<ForceRefresh>false</ForceRefresh>"
+        )));
+        // The request itself still parses with the flag present.
+        let parsed = quick_xml::de::from_str::<XSTSTokenRequest>(&request(
+            "<ForceRefresh>true</ForceRefresh>",
+        ))
+        .unwrap();
+        assert_eq!(parsed.url, "https://xboxlive.com");
+    }
+
+    #[test]
+    fn a_forced_refresh_skips_the_cache_once_per_interval() {
+        let key = format!("refresh-test-{:?}", std::time::Instant::now());
+        let now = 1_900_000_000;
+        XSTS_CACHE.lock().unwrap().insert(
+            key.clone(),
+            CachedToken {
+                signer: SIGNER.clone(),
+                token: "cached-fixture".into(),
+                xuid: String::new(),
+                gamertag: String::new(),
+                expiry: now + 3600,
+            },
+        );
+        assert!(cached_token_for(&key, now, false).is_some());
+        assert!(
+            cached_token_for(&key, now, true).is_none(),
+            "first forced refresh re-mints"
+        );
+        assert!(
+            cached_token_for(&key, now + 5, true).is_some(),
+            "a second one within the interval gets the token just minted"
+        );
+        assert!(cached_token_for(&key, now + FORCED_REFRESH_INTERVAL, true).is_none());
+        assert!(cached_token_for(&key, now, false).is_some());
+    }
+}
+
+#[cfg(test)]
 mod framing_tests {
     use super::*;
-    async fn decode(kind: u16, marker: u16, length: Option<u32>, payload: &[u8]) -> std::io::Result<(XodusMessageType, Vec<u8>)> {
+    async fn decode(
+        kind: u16,
+        marker: u16,
+        length: Option<u32>,
+        payload: &[u8],
+    ) -> std::io::Result<(XodusMessageType, Vec<u8>)> {
         let mut wire = kind.to_le_bytes().to_vec();
         wire.extend(marker.to_le_bytes());
-        if let Some(length) = length { wire.extend(length.to_le_bytes()); }
+        if let Some(length) = length {
+            wire.extend(length.to_le_bytes());
+        }
         wire.extend(payload);
         read_request(&mut wire.as_slice()).await
     }

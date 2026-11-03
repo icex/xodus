@@ -18,6 +18,18 @@ mod utils;
 const XML_MAGIC: u32 = 0x58445358;
 const PROTO_MAGIC: u32 = 0x58445350;
 
+/// How long to wait after a failed accept before the next one. Out of file
+/// descriptors or memory, accepting again at once would only fail again in a
+/// tight loop; the pause lets connections close. Anything else is one bad
+/// connection and costs a token pause.
+fn accept_backoff(error: &std::io::Error) -> std::time::Duration {
+    // EMFILE, ENFILE, ENOBUFS and ENOMEM on Linux.
+    match error.raw_os_error() {
+        Some(24 | 23 | 105 | 12) => std::time::Duration::from_millis(500),
+        _ => std::time::Duration::from_millis(10),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|arg| arg == "--capabilities") {
@@ -56,14 +68,19 @@ async fn main() {
 
     xodus::secrets::init_secrets().expect("Failed to init keychain");
     let root = xodus::profiles::root().expect("Account profile directory unavailable");
-    let default = xodus::profiles::default_id(&root).expect("Invalid default account profile");
     let select = |role: &str| {
-        let id = std::env::var(role).ok().or_else(|| default.clone());
-        match id {
-            Some(id) => {
-                xodus::profiles::load(&root, &id).expect("Selected account profile is unavailable");
-                TokenManager::for_profile(&id).expect("Invalid account profile")
+        let requested = std::env::var(role).ok().filter(|id| !id.is_empty());
+        // The legacy, unscoped sign-in only while no profile exists at all;
+        // once one does, an unnamed role is the default or an error.
+        let id = match xodus::profiles::select(&root, requested.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("{role}: {e}");
+                std::process::exit(1);
             }
+        };
+        match id {
+            Some(id) => TokenManager::for_profile(&id).expect("Invalid account profile"),
             None => TokenManager::with_keychain_and_memory(),
         }
         .pin_user()
@@ -105,8 +122,19 @@ async fn main() {
             let accept = tokio::select! {
                 r = listener.accept() => r,
                 _ = cancellation.cancelled() => break,
-            }
-            .expect("Failed to accept");
+            };
+            // A failed accept is one connection lost, never the service: every
+            // running title depends on it for sign-in and licences.
+            let accept = match accept {
+                Ok(accept) => accept,
+                Err(e) => {
+                    tracing::warn!("accept failed: {e}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(accept_backoff(&e)) => continue,
+                        _ = cancellation.cancelled() => break,
+                    }
+                }
+            };
 
             let token = cancellation.clone();
             let device_token = device_token.clone();
@@ -130,4 +158,18 @@ async fn main() {
     }
 
     _ = tokio::fs::remove_file(socket_path).await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_failed_accept_backs_off_instead_of_ending_the_service() {
+        let too_many_files = std::io::Error::from_raw_os_error(24);
+        assert_eq!(
+            super::accept_backoff(&too_many_files),
+            std::time::Duration::from_millis(500)
+        );
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(super::accept_backoff(&aborted) < std::time::Duration::from_millis(100));
+    }
 }

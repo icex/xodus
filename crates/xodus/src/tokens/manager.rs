@@ -68,6 +68,43 @@ mod profile_tests {
     }
 
     #[test]
+    fn signing_out_a_migrated_account_removes_its_legacy_original_only() {
+        let legacy = TokenManager::with_memory();
+        legacy.save_user(&user("migrated-fixture")).unwrap();
+        legacy
+            .save_user_token(
+                PASSPORT_STS.into(),
+                Token::Compact("migrated-fixture".into()),
+            )
+            .unwrap();
+        legacy
+            .save_device_token(PASSPORT_STS.into(), Token::Compact("device-fixture".into()))
+            .unwrap();
+        legacy.migrate_user_to(OWNER).unwrap();
+        let other = legacy.scoped(PLAYER).unwrap();
+        other.save_user(&user("other-fixture")).unwrap();
+        other
+            .save_user_token(PASSPORT_STS.into(), Token::Compact("other-fixture".into()))
+            .unwrap();
+
+        // A different account's logout leaves the legacy sign-in alone.
+        other.remove_persistent().unwrap();
+        assert_eq!(legacy.get_user().unwrap().puid, "migrated-fixture");
+
+        legacy.scoped(OWNER).unwrap().remove_persistent().unwrap();
+        assert!(legacy.scoped(OWNER).unwrap().get_user().is_err());
+        assert!(matches!(legacy.get_user(), Err(TokenStoreError::NotFound)));
+        assert!(matches!(
+            legacy.get_user_sts_token(),
+            Err(TokenStoreError::NotFound)
+        ));
+        // The device registration is shared and survives every user logout.
+        assert!(legacy.get_device_sts_token().is_ok());
+        // Signing out an account that is already signed out is not an error.
+        legacy.scoped(OWNER).unwrap().remove_persistent().unwrap();
+    }
+
+    #[test]
     fn a_live_service_cannot_follow_replacement_credentials_in_its_profile() {
         let backend = TokenManager::with_memory();
         let profile = backend.scoped(OWNER).unwrap();
@@ -253,7 +290,26 @@ impl TokenManager {
 
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
         if self.profile.is_some() {
-            return self.remove_user();
+            // Migration copied the pre-profile sign-in and left the original
+            // for older launchers. Signing that account out has to remove the
+            // original too, or the refresh credential stays in the keyring and
+            // a later migration would bring the signed-out account back. Only
+            // the same Microsoft account's entries go; a different legacy
+            // sign-in is not this logout's business.
+            let puid = self.get_user().ok().map(|user| user.puid);
+            self.remove_user()?;
+            if let Some(puid) = puid.filter(|p| !p.is_empty()) {
+                let legacy = Self {
+                    persistent: self.persistent.clone(),
+                    ephemeral: Arc::new(MemoryBackend::default()),
+                    profile: None,
+                    expected_user: None,
+                };
+                if legacy.get_user().is_ok_and(|user| user.puid == puid) {
+                    legacy.remove_user()?;
+                }
+            }
+            return Ok(());
         }
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;

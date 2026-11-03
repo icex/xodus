@@ -237,9 +237,11 @@ async fn main() -> ExitCode {
     {
         registry.init();
     }
+    // No connection_verbose: it logs the decrypted traffic, Authorization
+    // headers and token bodies included, at trace level, and XODUS_LOG=trace
+    // is what an issue report asks for.
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
-        .connection_verbose(true)
         .build()
         .unwrap();
     let args = CliArgs::parse();

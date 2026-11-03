@@ -5,6 +5,17 @@ use std::sync::Arc;
 use xodus::models::secrets::LegacyToken;
 use xodus::tokens::TokenManager;
 
+/// One HTTP client for every connection, so they share its connection pool.
+/// Never built with connection_verbose: that logs the decrypted traffic, with
+/// XBL3.0 Authorization headers, Signature headers and SOAP token bodies, to
+/// the service log whenever trace logging is on.
+static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::ClientBuilder::new()
+        .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("HTTP client")
+});
+
 pub struct SimpleContext {
     pub entitlement: Option<Arc<crate::entitlement::Entitlement>>,
     /// The title this service was started for, when the launcher said.
@@ -94,14 +105,8 @@ impl SimpleContext {
         store_tokens: Arc<TokenManager>,
         tokens: Arc<TokenManager>,
     ) -> Self {
-        let client = reqwest::ClientBuilder::new()
-            .user_agent(format!("xodus-service/{}", env!("CARGO_PKG_VERSION")))
-            .connection_verbose(true)
-            .build()
-            .unwrap();
-
         Self {
-            client,
+            client: CLIENT.clone(),
             entitlement: None,
             title: None,
             device_token: Some(device_token),

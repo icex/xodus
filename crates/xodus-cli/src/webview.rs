@@ -155,6 +155,84 @@ pub fn finalize_request(url: String) -> WebviewRequest {
     WebviewRequest::new("Xodus login", url, HeaderMap::new())
 }
 
+/// Origins whose pages may talk to the sign-in host. The IPC bridge hands
+/// over the account's tokens, so a page from anywhere else -- an ad, a help
+/// link, a redirect the sign-in flow did not intend -- must not reach it.
+const IPC_ORIGINS: [&str; 2] = ["login.live.com", "login.microsoftonline.com"];
+
+/// Domains the sign-in window may navigate to: Microsoft account pages, their
+/// CDNs, and the challenge provider the sign-in pages embed. Nothing else, and
+/// nothing but https, so the window cannot be turned into a general browser
+/// that still holds the bridge.
+const NAVIGATION_DOMAINS: [&str; 8] = [
+    "live.com",
+    "microsoftonline.com",
+    "microsoft.com",
+    "msauth.net",
+    "msftauth.net",
+    "live.net",
+    "xboxlive.com",
+    "arkoselabs.com",
+];
+
+fn https_host(url: &str) -> Option<String> {
+    let uri: wry::http::Uri = url.parse().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') || authority.port().is_some_and(|p| p.as_u16() != 443) {
+        return None;
+    }
+    Some(authority.host().to_ascii_lowercase())
+}
+
+/// Whether a bridge message came from a Microsoft sign-in page.
+fn trusted_ipc_origin(url: &str) -> bool {
+    https_host(url).is_some_and(|host| IPC_ORIGINS.contains(&host.as_str()))
+}
+
+/// Whether the sign-in window may load `url`.
+fn allowed_navigation(url: &str) -> bool {
+    if matches!(url, "about:blank" | "about:srcdoc") {
+        return true;
+    }
+    https_host(url).is_some_and(|host| {
+        NAVIGATION_DOMAINS.iter().any(|domain| {
+            host == *domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
+    })
+}
+
+/// The script that answers the bridge's getContext call. `context` comes from
+/// the page, so it is embedded as a JSON value, never spliced into the source.
+fn host_context_script(context: &str) -> String {
+    let message = serde_json::json!({
+        "type": "callback",
+        "value": {
+            "name": "CloudExperienceHost.getContext",
+            "args": [
+                "CloudExperienceHost",
+                "TokenBroker",
+                "TokenBroker",
+                r#"{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}"#
+            ],
+            "context": context,
+        }
+    });
+    // The JSON text of the message is itself passed as a string, as the bridge
+    // expects. U+2028 and U+2029 are valid in JSON but end a line in older
+    // JavaScript, so they are escaped too.
+    let argument = serde_json::to_string(&message.to_string())
+        .unwrap_or_default()
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    format!(r#"window["CloudExperienceHost.Bridge.dispatchMessage"]({argument})"#)
+}
+
 pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>
 where
     T: SessionHandler,
@@ -187,13 +265,9 @@ where
                 session_id,
                 request,
             }) => {
-                if let Err(err) = create_session(
-                    target,
-                    proxy.clone(),
-                    &mut state,
-                    session_id,
-                    request,
-                ) {
+                if let Err(err) =
+                    create_session(target, proxy.clone(), &mut state, session_id, request)
+                {
                     state.error = Some(err.to_string());
                 }
             }
@@ -201,23 +275,21 @@ where
                 if state.active_session == Some(session_id)
                     && let Some(webview) = state.active_webview.as_ref()
                 {
-                    let _ = webview.evaluate_script("window.ipc.postMessage(JSON.stringify(ServerData))");
+                    let _ = webview
+                        .evaluate_script("window.ipc.postMessage(JSON.stringify(ServerData))");
                 }
             }
             Event::UserEvent(CustomEvent::HostGetContext(session_id, ctx)) => {
                 if state.active_session == Some(session_id)
                     && let Some(webview) = state.active_webview.as_ref()
                 {
-                    let _ = webview.evaluate_script(&format!(r#"window["CloudExperienceHost.Bridge.dispatchMessage"](JSON.stringify({{"type": "callback", "value": {{ "name": "CloudExperienceHost.getContext", "args": ["CloudExperienceHost", "TokenBroker", "TokenBroker", "{{\"PrivatePropertyBag\":1,\"PasswordlessConnect\":1,\"PreferAssociate\":1,\"ChromelessUI\":0}}"], "context": "{ctx}"}}}}))"#));
+                    let _ = webview.evaluate_script(&host_context_script(&ctx));
                 }
             }
             Event::UserEvent(CustomEvent::IpcCallback(session_id, data)) => {
-                apply_handler_result(
-                    &proxy,
-                    target,
-                    &mut state,
-                    move |handler, runtime| handler.on_token(session_id, data, runtime),
-                );
+                apply_handler_result(&proxy, target, &mut state, move |handler, runtime| {
+                    handler.on_token(session_id, data, runtime)
+                });
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -345,7 +417,18 @@ fn create_session<T: SessionHandler>(
             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
             .with_headers(request.headers)
             .with_initialization_script("window.external = {notify: window.ipc.postMessage }")
+            .with_navigation_handler(|url| {
+                let allowed = allowed_navigation(&url);
+                if !allowed {
+                    eprintln!("Sign-in window: blocked navigation away from Microsoft sign-in");
+                }
+                allowed
+            })
             .with_ipc_handler(move |request| {
+                if !trusted_ipc_origin(&request.uri().to_string()) {
+                    eprintln!("Ignoring a sign-in bridge message from outside Microsoft sign-in");
+                    return;
+                }
                 let body = request.body();
                 let payload = serde_json::from_str::<DAProperty>(body);
                 if let Ok(data) = payload {
@@ -376,7 +459,9 @@ fn create_session<T: SessionHandler>(
                 }
             })
             .with_on_page_load_handler(move |event, url| {
-                if matches!(event, PageLoadEvent::Finished) && url.starts_with("https://login.live.com/ppsecure/post.srf")
+                if matches!(event, PageLoadEvent::Finished)
+                    && https_host(&url).as_deref() == Some("login.live.com")
+                    && url.starts_with("https://login.live.com/ppsecure/post.srf")
                 {
                     proxy.send_event(CustomEvent::Finish(session_id)).ok();
                 }
@@ -400,5 +485,73 @@ fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: Se
     if state.active_session == Some(session_id) {
         state.active_session = None;
         state.active_webview = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_microsoft_sign_in_pages_reach_the_bridge() {
+        assert!(trusted_ipc_origin(
+            "https://login.live.com/ppsecure/post.srf?x=1"
+        ));
+        assert!(trusted_ipc_origin(
+            "https://LOGIN.microsoftonline.com/common"
+        ));
+        for url in [
+            "http://login.live.com/",
+            "https://login.live.com.example.test/",
+            "https://login.live.com@example.test/",
+            "https://evil-login.live.com/",
+            "https://account.live.com/",
+            "https://login.live.com:8443/",
+            "file:///login.live.com",
+            "",
+        ] {
+            assert!(!trusted_ipc_origin(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn navigation_stays_on_microsoft_sign_in_domains() {
+        for url in [
+            "https://login.live.com/oauth20_authorize.srf",
+            "https://account.live.com/proofs/Add",
+            "https://logincdn.msauth.net/shared/1.0/content/js/x.js",
+            "https://client-api.arkoselabs.com/fc/gt2/",
+            "about:blank",
+        ] {
+            assert!(allowed_navigation(url), "{url}");
+        }
+        for url in [
+            "http://login.live.com/",
+            "https://example.test/",
+            "https://notlive.com/",
+            "https://live.com.example.test/",
+            "javascript:alert(1)",
+            "data:text/html,x",
+        ] {
+            assert!(!allowed_navigation(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_page_supplied_context_cannot_escape_its_string() {
+        let hostile = "x\"}}));alert(1);//\u{2028}";
+        let script = host_context_script(hostile);
+        let prefix = r#"window["CloudExperienceHost.Bridge.dispatchMessage"]("#;
+        let argument = script
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap();
+        // The argument is one JSON string literal, which decodes to the
+        // message, whose context is the page's value unchanged.
+        let text: String = serde_json::from_str(argument).unwrap();
+        let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(message["value"]["context"], hostile);
+        assert_eq!(message["value"]["name"], "CloudExperienceHost.getContext");
+        assert!(!script.contains('\u{2028}'));
     }
 }

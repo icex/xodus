@@ -191,7 +191,13 @@ pub async fn run(
         }
     };
     let xuid = plain.xuid().unwrap_or_default().to_string();
-    let plain_auth = xodus::api::xbox::get_xsts_auth_header(plain);
+    let plain_auth = match super::collections::auth_header(plain) {
+        Ok(auth) => auth,
+        Err(message) => {
+            eprintln!("!! {message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let mut failed = 0;
     for probe in UNCLAIMED {
@@ -218,8 +224,8 @@ pub async fn run(
     // The claim itself. A failure here is the interesting one, and it is the
     // failure a title reports as "failed to create party".
     let claimed = title_claim_xsts(client, tokens, &identity).await;
-    let claimed_auth = match claimed {
-        Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
+    let claimed_auth = match claimed.and_then(super::collections::auth_header) {
+        Ok(auth) => auth,
         Err(message) => {
             eprintln!(
                 "!! could not mint a token claiming title {}: {message}",
@@ -270,16 +276,27 @@ pub async fn run(
 
 fn first_line(body: &str) -> String {
     let line = body.lines().next().unwrap_or_default().trim();
-    if line.len() > 120 {
-        format!("{}...", &line[..120])
-    } else {
-        line.to_string()
+    // At most 120 characters, cut on a character: a byte offset can land
+    // inside a non-ASCII character of a localised error body and panic.
+    match line.char_indices().nth(120) {
+        Some((end, _)) => format!("{}...", &line[..end]),
+        None => line.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_non_ascii_response_line_is_shortened_without_splitting_a_character() {
+        // Byte 120 falls inside the 60th "é": slicing there panicked.
+        let body = format!("a{}\nsecond line", "é".repeat(200));
+        let line = first_line(&body);
+        assert_eq!(line, format!("a{}...", "é".repeat(119)));
+        assert_eq!(first_line(&"a".repeat(120)), "a".repeat(120));
+        assert_eq!(first_line("  short  \nrest"), "short");
+    }
 
     #[test]
     fn a_game_config_yields_the_pair_xbox_mints_a_claim_from() {
