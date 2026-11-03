@@ -367,11 +367,87 @@ fn sign_for_with(
     )
 }
 
+/// Who an XSTS request is for: the title, over the socket, or the service's
+/// own licence path, which has already held its request to the bound title.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Caller {
+    Title,
+    Licensing,
+}
+
+/// Whether the launcher bound this service to one title.
+fn bound(context: &SimpleContext) -> bool {
+    context.entitlement.is_some() || context.title.is_some()
+}
+
+/// Keep the licensing audience to the licence path in a bound service.
+///
+/// The licence path holds a request to the bound product and its add-ons, but
+/// a title asking for the licensing audience itself could sign a licence
+/// request of its own choosing: the signature covers the method, path and
+/// body, not the host, so any URL resolving to that audience will do. Where
+/// that token would be the Store account's -- one account in both roles -- it
+/// is refused. A Player who is another account gets their own licensing
+/// authorization, as on any other machine.
+fn licensing_audience_gate(
+    context: &SimpleContext,
+    relying_party: &str,
+    endpoints: &EndpointConfig,
+) -> Result<(), String> {
+    // The scheme is not part of who the token is for: `http://` and
+    // `https://` spellings of one host are the same audience here.
+    let audience = |rp: &str| {
+        let rp = rp.trim().to_ascii_lowercase();
+        let rp = rp
+            .strip_prefix("https://")
+            .or_else(|| rp.strip_prefix("http://"))
+            .unwrap_or(&rp);
+        rp.trim_end_matches('/').to_string()
+    };
+    if !bound(context)
+        || audience(relying_party) != audience(&endpoints.relying_party(super::license::URL))
+        || !context.player_is_store_account()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "refused an XSTS request for the licensing audience {relying_party:?}; the Player is the Store account here, and licence tokens come only from licence requests for the bound title"
+    ))
+}
+
 pub(super) async fn xsts_token(
     context: &mut SimpleContext,
     req: XSTSTokenRequest,
 ) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+    xsts_token_for(context, req, Caller::Title).await
+}
+
+pub(super) async fn xsts_token_for(
+    context: &mut SimpleContext,
+    req: XSTSTokenRequest,
+    caller: Caller,
+) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     tracing::debug!("XSTS token request for {}", req.url);
+
+    // A service bound to one title mints tokens claiming that title only. The
+    // claim is what services that scope by title go by, and the request's own
+    // TitleId is whatever the title chose to put there.
+    if let Some(bound) = &context.title
+        && let Err(refusal) = bound.admits(&req)
+    {
+        tracing::warn!("{refusal}");
+        return Err(refusal.into());
+    }
+    // Bound to a product alone, without a title identity: the audience still
+    // comes from the endpoint list, never from the request.
+    if caller == Caller::Title && bound(context) && !req.relying_party.is_empty() {
+        let refusal = format!(
+            "refused an XSTS request naming its own relying party {:?}; a bound service resolves it from the endpoint list",
+            req.relying_party
+        );
+        tracing::warn!("{refusal}");
+        return Err(refusal.into());
+    }
 
     // Read the persisted credential before any cache lookup: a logout
     // invalidates access and a different login must never reuse an old identity.
@@ -421,6 +497,12 @@ pub(super) async fn xsts_token(
     } else {
         req.relying_party.clone()
     };
+    if caller == Caller::Title
+        && let Err(refusal) = licensing_audience_gate(context, &relying_party, &endpoints)
+    {
+        tracing::warn!("{refusal}");
+        return Err(refusal.into());
+    }
     let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
     let now = chrono::Utc::now().timestamp();
     if let Some(hit) = XSTS_CACHE
@@ -567,6 +649,18 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
+            // An MSA ticket is enough to run Xbox sign-in from scratch and mint
+            // XSTS tokens for any title and audience, past every check above;
+            // even one for the bound title's own client ID would be. The
+            // runtime never asks for one, so a bound service hands out none.
+            if bound(context) {
+                let refusal = format!(
+                    "refused an MSA token request for client {:?}; a title-bound service issues no Microsoft account tickets",
+                    req.client_id
+                );
+                tracing::warn!("{refusal}");
+                return Err(refusal.into());
+            }
             let Token::Legacy(token) = context.tokens().get_user_sts_token()? else {
                 return Ok(vec![]);
             };

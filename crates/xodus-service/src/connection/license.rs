@@ -7,7 +7,7 @@ use std::time::Duration;
 use xodus::models::licensing::LicenseTokenResponse;
 use xodus::models::xgameruntime::xuser::{LicenseTokenIpcRequest, XSTSTokenRequest};
 
-const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
+pub(super) const URL: &str = "https://licensing.mp.microsoft.com/v8.0/licenseToken";
 const MAX_RESPONSE: usize = 65536;
 const MAX_TOKEN: usize = 60000; // fits the IPC frame and the DLL result buffer
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -114,8 +114,13 @@ async fn post(
     parse_response(&bytes)
 }
 
+fn parse(xml: &[u8]) -> Result<LicenseTokenIpcRequest, Error> {
+    quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
+        .map_err(|_| "invalid IPC request")
+}
+
 async fn fetch_with<F, Fut>(
-    xml: &[u8],
+    req: LicenseTokenIpcRequest,
     url: &str,
     client: &reqwest::Client,
     authorize: F,
@@ -126,9 +131,6 @@ where
             Output = Result<xodus::models::xgameruntime::xuser::XSTSTokenResponse, Error>,
         >,
 {
-    let req: LicenseTokenIpcRequest =
-        quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
-            .map_err(|_| "invalid IPC request")?;
     let bytes = body(&req)?;
     let auth = authorize(XSTSTokenRequest {
         url: url.into(),
@@ -142,21 +144,69 @@ where
     post(client, url, bytes, &auth.token, &auth.signature).await
 }
 
-pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
-    // A service bound to one title signs licence requests for that title
-    // only: the Store account's token is not the running game's to spend on
-    // another product it happens to own.
-    if let Some(bound) = &context.entitlement {
-        let req: LicenseTokenIpcRequest =
-            quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
-                .map_err(|_| "invalid IPC request")?;
-        if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
-            return Err("licence token request is for another title");
+/// Hold a licence request to the title the service is bound to.
+///
+/// A service bound to one title signs licence requests for that title only:
+/// the Store account's token is not the running game's to spend on another
+/// product it happens to own. The parent must be the bound product, every
+/// product ID must be one the Store catalog ties to it (see
+/// `Entitlement::admit_products`), and the request is signed under the bound
+/// title's identity whatever TitleId and TitleClientId it carried. An unbound
+/// service changes nothing.
+async fn scope<L, Fut>(
+    context: &SimpleContext,
+    req: &mut LicenseTokenIpcRequest,
+    lookup: L,
+) -> Result<(), Error>
+where
+    L: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<serde_json::Value>, Error>>,
+{
+    let Some(bound) = &context.entitlement else {
+        // A service bound to a title is bound to its product too; one
+        // without the product could not hold the request to it.
+        if context.title.is_some() {
+            tracing::warn!(
+                "refused a licence token: this service has a title binding but no product"
+            );
+            return Err("licence token request without a bound product");
         }
+        return Ok(());
+    };
+    if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
+        tracing::warn!(
+            "refused a licence token with parent {:?}; this service is bound to {}",
+            req.parent_product_id,
+            bound.product()
+        );
+        return Err("licence token request is for another title");
     }
+    if let Err(refusal) = bound.admit_products(&req.product_ids.ids, lookup).await {
+        tracing::warn!("{refusal}");
+        return Err("licence token request names products outside the bound title");
+    }
+    if let Some(title) = &context.title {
+        if req.title_id != title.title_id() || req.title_client_id != title.client_id() {
+            tracing::info!(
+                "licence token request claimed title {:?} (client {:?}); signing it as the bound title {:?} (client {:?})",
+                req.title_id,
+                req.title_client_id,
+                title.title_id(),
+                title.client_id()
+            );
+        }
+        req.title_id = title.title_id();
+        req.title_client_id = title.client_id().into();
+    }
+    Ok(())
+}
+
+pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
+    let mut req = parse(xml)?;
+    scope(context, &mut req, super::catalog::relationships).await?;
     let mut store = context.store_context();
-    fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
-        super::xml::xsts_token(&mut store, req)
+    fetch_with(req, URL, &client(HTTP_TIMEOUT)?, |req| async move {
+        super::xml::xsts_token_for(&mut store, req, super::xml::Caller::Licensing)
             .await
             .map_err(|_| "licensing authorization failed")
     })

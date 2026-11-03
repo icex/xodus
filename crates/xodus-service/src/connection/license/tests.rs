@@ -261,7 +261,8 @@ async fn offline_service_fixture() {
                     }
                     _ => {}
                 }
-                let outcome = fetch_with(&bytes, &url, &client, |request| async move {
+                let req = parse(&bytes).unwrap();
+                let outcome = fetch_with(req, &url, &client, |request| async move {
                     assert_eq!(request.method, "POST");
                     assert_eq!(request.title_id, "1298034544");
                     assert_eq!(
@@ -328,5 +329,191 @@ async fn a_title_bound_service_signs_licence_requests_for_that_title_only() {
     assert_eq!(
         super::fetch(&mut context, xml.as_bytes()).await,
         Err("licence token request is for another title")
+    );
+}
+
+fn catalog_entry(id: &str, related: &[(&str, &str)]) -> serde_json::Value {
+    let related: Vec<_> = related
+        .iter()
+        .map(|(id, kind)| serde_json::json!({"RelatedProductId": id, "RelationshipType": kind}))
+        .collect();
+    serde_json::json!({"ProductId": id, "MarketProperties": [{"RelatedProducts": related}]})
+}
+
+/// The bound game, which names a bundle containing it and the storefront
+/// that sells it; an add-on and an edition that name the game; and an
+/// unrelated product only recommended alongside it.
+fn catalog() -> Vec<serde_json::Value> {
+    vec![
+        catalog_entry(
+            "9TESTSTORE0I",
+            &[("9TESTBUNDLE0", "Bundle"), ("9TESTLAUNCH0", "SellableBy")],
+        ),
+        catalog_entry(
+            "9TESTADDON00",
+            &[
+                ("9TESTSTORE0I", "addOnParent"),
+                ("9TESTSTORE0I", "SellableBy"),
+            ],
+        ),
+        catalog_entry("9TESTDELUXE0", &[("9TESTSTORE0I", "Parent")]),
+        catalog_entry("9TESTBUNDLE0", &[]),
+        catalog_entry("9TESTLAUNCH0", &[]),
+        catalog_entry("9OTHERGAME00", &[("9TESTSTORE0I", "Recommendation")]),
+        catalog_entry("9SOLDBYGAME0", &[("9TESTSTORE0I", "SellableBy")]),
+    ]
+}
+
+fn bound_request(products: &[&str], title: &str, client: &str) -> LicenseTokenIpcRequest {
+    let products: String = products
+        .iter()
+        .map(|id| format!("<ProductId>{id}</ProductId>"))
+        .collect();
+    parse(format!(
+        "<LicenseTokenRequest><ParentProductId>9TESTSTORE0I</ParentProductId><ProductIds>{products}</ProductIds><CustomBase64>{}</CustomBase64><TitleId>{title}</TitleId><TitleClientId>{client}</TitleClientId></LicenseTokenRequest>",
+        STANDARD.encode("fixture")
+    ).as_bytes())
+    .unwrap()
+}
+
+fn bound_context() -> SimpleContext {
+    let mut context = crate::simple_context::tests::context("owner-scope", "player-scope");
+    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
+    context.title = Some(crate::title::TitleIdentity::fixture(
+        1805509784,
+        "00000000-0000-0000-0000-00004C26E6C9",
+    ));
+    context
+}
+
+/// A catalog lookup that serves `catalog()` and counts how often it was asked.
+fn lookup(
+    calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl FnOnce(Vec<String>) -> std::future::Ready<Result<Vec<serde_json::Value>, Error>> {
+    let calls = calls.clone();
+    move |ids: Vec<String>| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            ids[0], "9TESTSTORE0I",
+            "the bound product is always looked up"
+        );
+        std::future::ready(Ok(catalog()
+            .into_iter()
+            .filter(|entry| {
+                ids.iter()
+                    .any(|id| id == entry["ProductId"].as_str().unwrap())
+            })
+            .collect()))
+    }
+}
+
+#[tokio::test]
+async fn a_bound_service_refuses_licence_tokens_for_products_outside_the_title() {
+    let context = bound_context();
+    let calls = Default::default();
+    for products in [
+        &["9TESTSTORE0I", "9OTHERGAME00"][..],
+        &["9TESTADDON00", "9NOTINCATALG"],
+        &["9TESTSTORE0I", "../../escape"],
+        &["9TESTSTORE0I", "9TESTADDON00X"],
+        // Listed by the game, not naming it: a bundle and a storefront can
+        // grant other titles.
+        &["9TESTSTORE0I", "9TESTBUNDLE0"],
+        &["9TESTSTORE0I", "9TESTLAUNCH0"],
+        // Sold through the game, but not one of its add-ons or editions.
+        &["9TESTSTORE0I", "9SOLDBYGAME0"],
+    ] {
+        let mut req = bound_request(products, "1805509784", "");
+        assert_eq!(
+            scope(&context, &mut req, lookup(&calls)).await,
+            Err("licence token request names products outside the bound title"),
+            "{products:?}"
+        );
+    }
+    // A catalog that cannot be reached confirms nothing.
+    let mut req = bound_request(&["9TESTSTORE0I", "9TESTBUNDLE0"], "1805509784", "");
+    let unreachable = |_| std::future::ready(Err("product catalog transport failed"));
+    assert!(scope(&context, &mut req, unreachable).await.is_err());
+}
+
+#[tokio::test]
+async fn a_bound_service_licenses_its_own_product_and_confirmed_add_ons_as_itself() {
+    let context = bound_context();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The game alone needs no catalog at all.
+    let mut req = bound_request(&["9teststore0i"], "1805509784", "");
+    scope(&context, &mut req, lookup(&calls)).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The title claims another title's identity; the signed request does not.
+    let mut req = bound_request(
+        &["9TESTSTORE0I", "9TESTADDON00", "9TESTDELUXE00010"],
+        "1298034544",
+        "00000000-0000-0000-0000-000000000000",
+    );
+    scope(&context, &mut req, lookup(&calls)).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let signed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = signed.clone();
+    let result = fetch_with(
+        req,
+        URL,
+        &client(HTTP_TIMEOUT).unwrap(),
+        |request| async move {
+            *seen.lock().unwrap() = Some((
+                request.title_id,
+                request.title_client_id,
+                STANDARD.decode(request.body_base64).unwrap(),
+            ));
+            Err("stop before the network")
+        },
+    )
+    .await;
+    assert_eq!(result, Err("stop before the network"));
+    let (title, client, body) = signed.lock().unwrap().take().unwrap();
+    assert_eq!(title, "1805509784");
+    assert_eq!(client, "00000000-0000-0000-0000-00004C26E6C9");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["parentProductId"], "9TESTSTORE0I");
+    assert_eq!(
+        body["relatedProductIds"],
+        "[\"9TESTSTORE0I\",\"9TESTADDON00\",\"9TESTDELUXE00010\"]"
+    );
+
+    // Confirmed products are remembered for the life of the service.
+    let mut req = bound_request(&["9TESTADDON00"], "1805509784", "");
+    scope(&context, &mut req, lookup(&calls)).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_unbound_service_signs_licence_requests_as_before() {
+    let context = crate::simple_context::tests::context("owner-unbound", "player-unbound");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut req = bound_request(&["9OTHERGAME00"], "1298034544", "client");
+    scope(&context, &mut req, lookup(&calls)).await.unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(req.title_id, "1298034544");
+    assert_eq!(req.title_client_id, "client");
+    assert_eq!(req.product_ids.ids, ["9OTHERGAME00"]);
+
+    // A service bound to a product by an older launcher, which passed no
+    // title identity, still scopes the products but keeps the request's title.
+    let mut context = context;
+    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
+    let mut req = bound_request(&["9TESTADDON00"], "1298034544", "client");
+    scope(&context, &mut req, lookup(&calls)).await.unwrap();
+    assert_eq!(req.title_id, "1298034544");
+}
+
+#[tokio::test]
+async fn a_title_bound_service_without_a_product_refuses_licence_tokens() {
+    let mut context = bound_context();
+    context.entitlement = None;
+    let calls = Default::default();
+    let mut req = bound_request(&["9TESTSTORE0I"], "1805509784", "");
+    assert_eq!(
+        scope(&context, &mut req, lookup(&calls)).await,
+        Err("licence token request without a bound product")
     );
 }

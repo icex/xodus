@@ -12,6 +12,7 @@ use xodus::tokens::TokenManager;
 mod connection;
 mod entitlement;
 mod simple_context;
+mod title;
 mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;
@@ -21,7 +22,7 @@ const PROTO_MAGIC: u32 = 0x58445350;
 async fn main() {
     if std::env::args().any(|arg| arg == "--capabilities") {
         println!(
-            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\"]}}"
+            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\",\"title-scoped-tokens\"]}}"
         );
         return;
     }
@@ -71,6 +72,13 @@ async fn main() {
     let tokens = Arc::new(select("XODUS_PLAYER_PROFILE"));
     let store_tokens = Arc::new(select("XODUS_STORE_PROFILE"));
     let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
+    let title = title::TitleIdentity::from_env().expect("Invalid title identity binding");
+    if entitlement.is_some() && title.is_none() {
+        // An older launcher: the product is bound, the title identity is not.
+        tracing::warn!(
+            "bound to a Store product without XODUS_TITLE_ID; title identities on requests are not pinned"
+        );
+    }
     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
     let xodus::models::secrets::Token::Legacy(device_token) =
         tokens.get_device_sts_token().unwrap()
@@ -105,6 +113,7 @@ async fn main() {
             let tokens = tokens.clone();
             let store_tokens = store_tokens.clone();
             let entitlement = entitlement.clone();
+            let title = title.clone();
             tokio::spawn(async move {
                 connection::router::route(
                     accept.0,
@@ -113,6 +122,7 @@ async fn main() {
                     tokens,
                     store_tokens,
                     entitlement,
+                    title,
                 )
                 .await
             });

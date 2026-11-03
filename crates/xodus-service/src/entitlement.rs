@@ -1,4 +1,6 @@
 //! A title-bound Store licence. No running-title or player ownership inference.
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xodus::tokens::TokenManager;
@@ -7,6 +9,43 @@ pub struct Entitlement {
     product: String,
     content: String,
     cached: tokio::sync::Mutex<Option<Check>>,
+    /// Products the Store catalog was asked about, and whether it ties each
+    /// one to the bound product. Only answers the catalog gave are kept.
+    family: tokio::sync::Mutex<HashMap<String, bool>>,
+}
+
+/// The relationships under which a product's own catalog entry names the game
+/// it belongs to: an add-on or consumable to its game (`addOnParent`) and an
+/// edition to the game it extends (`Parent`, `Extends`). Only the requested
+/// product's entry counts: a game naming a bundle that contains it, or the
+/// storefront that sells it, is not a reason to license that bundle or
+/// storefront under this title, since either can grant other titles. Nor is
+/// `SellableBy` alone, which names where a product is sold, not what it
+/// belongs to; real add-ons carry it beside `addOnParent`. Dungeons II's own
+/// licence request asks for exactly this shape: its Soul and Hero packs, each
+/// naming the game as `addOnParent` (and `SellableBy`).
+const FAMILY: [&str; 3] = ["addOnParent", "Parent", "Extends"];
+
+/// Whether a catalog entry names `other` under one of the family relationships.
+fn related(entry: &Value, other: &str) -> bool {
+    entry["MarketProperties"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|market| market["RelatedProducts"].as_array())
+        .flatten()
+        .any(|relation| {
+            relation["RelatedProductId"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(other))
+                && relation["RelationshipType"]
+                    .as_str()
+                    .is_some_and(|kind| FAMILY.iter().any(|f| f.eq_ignore_ascii_case(kind)))
+        })
+}
+
+fn entry_id(entry: &Value) -> &str {
+    entry["ProductId"].as_str().unwrap_or("")
 }
 
 /// The last answer, and when the licence was last actually granted.
@@ -40,6 +79,7 @@ impl Entitlement {
                     product,
                     content,
                     cached: Default::default(),
+                    family: Default::default(),
                 })))
             }
             _ => Err("invalid Store title binding".into()),
@@ -52,12 +92,83 @@ impl Entitlement {
             product: product.into(),
             content: "00000000-0000-0000-0000-000000000001".into(),
             cached: Default::default(),
+            family: Default::default(),
         })
     }
 
     /// The Store product this service is bound to.
     pub fn product(&self) -> &str {
         &self.product
+    }
+
+    /// Refuse licence tokens for products that are not this title's own.
+    ///
+    /// The bound product always passes. Any other ID must be a Store product
+    /// ID (twelve characters, or sixteen with a SKU) whose own catalog entry
+    /// names the bound product under one of the family relationships. That
+    /// covers a game's add-ons, consumables, DLC and editions, and nothing the
+    /// game merely lists, such as bundles. The
+    /// catalog is the only source for those relationships; when it cannot be
+    /// reached, or does not list a product, the request is refused rather
+    /// than signed on the title's word. The licensing request needs the
+    /// network as well, so an unreachable catalog costs nothing that would
+    /// have worked.
+    pub async fn admit_products<L, Fut>(&self, wanted: &[String], lookup: L) -> Result<(), String>
+    where
+        L: FnOnce(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<Value>, &'static str>>,
+    {
+        let mut products = Vec::new();
+        for id in wanted {
+            if !matches!(id.len(), 12 | 16) || !id.bytes().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(format!(
+                    "refused a licence token for {id:?}: not a Store product ID"
+                ));
+            }
+            let product = id[..12].to_ascii_uppercase();
+            if !product.eq_ignore_ascii_case(&self.product) && !products.contains(&product) {
+                products.push(product);
+            }
+        }
+        if products.is_empty() {
+            return Ok(());
+        }
+        let mut family = self.family.lock().await;
+        let unknown: Vec<_> = products
+            .iter()
+            .filter(|id| !family.contains_key(*id))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            let mut ask = vec![self.product.clone()];
+            ask.extend(unknown.iter().cloned());
+            let entries = lookup(ask).await.map_err(|cause| {
+                format!(
+                    "refused a licence token for {unknown:?}: the Store catalog could not confirm them as part of {} ({cause})",
+                    self.product
+                )
+            })?;
+            for id in &unknown {
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|entry| entry_id(entry).eq_ignore_ascii_case(id))
+                {
+                    family.insert(id.clone(), related(entry, &self.product));
+                }
+            }
+        }
+        let refused: Vec<_> = products
+            .iter()
+            .filter(|id| family.get(*id) != Some(&true))
+            .collect();
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "refused a licence token for {refused:?}: the Store catalog does not list them as add-ons or editions of {}",
+                self.product
+            ))
+        }
     }
 
     pub async fn valid(
@@ -142,6 +253,7 @@ mod tests {
                 valid: true,
                 granted: Some(Instant::now()),
             })),
+            family: Default::default(),
         };
         assert!(binding.valid("9TESTROLE0ID", &context.client, &owner).await);
         assert!(!binding.valid("9OTHERROLE00", &context.client, &owner).await);
@@ -168,6 +280,7 @@ mod tests {
                     valid: true,
                     granted: Some(now.checked_sub(granted_ago)?),
                 })),
+                family: Default::default(),
             })
         };
         if let Some(recent) = binding(Duration::from_secs(120)) {

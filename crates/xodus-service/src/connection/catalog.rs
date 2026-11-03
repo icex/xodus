@@ -390,13 +390,57 @@ fn product(out: &mut Vec<u8>, p: &Value, req: &Request) -> Result<bool, Error> {
     Ok(true)
 }
 
-async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
-    let client = reqwest::Client::builder()
+fn catalog_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(8))
         .build()
-        .map_err(|_| "cannot build catalog client")?;
+        .map_err(|_| "cannot build catalog client")
+}
+
+/// The catalog entries of up to 256 products, for their relationships.
+///
+/// Relationships do not depend on the market, so this asks the neutral one
+/// rather than guessing the account's. A product the catalog does not know is
+/// simply absent from the answer; anything it returns that was not asked for
+/// fails the whole lookup.
+pub(super) async fn relationships(ids: Vec<String>) -> Result<Vec<Value>, Error> {
+    if ids.len() > 256 || !ids.iter().all(|id| valid_id(id) && id.len() == 12) {
+        return Err("invalid catalog IDs");
+    }
+    let client = catalog_client()?;
+    let mut entries = Vec::new();
+    for chunk in ids.chunks(20) {
+        let value = json(
+            client
+                .get(format!(
+                    "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={}&market=neutral&languages=en-US",
+                    chunk.join(",")
+                ))
+                .send()
+                .await
+                .map_err(|_| "product catalog transport failed")?,
+        )
+        .await?;
+        let products = value["Products"]
+            .as_array()
+            .ok_or("missing catalog products")?;
+        for product in products {
+            if !chunk
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(string(product, "ProductId")))
+            {
+                return Err("unexpected catalog product");
+            }
+            entries.push(product.clone());
+        }
+    }
+    Ok(entries)
+}
+
+async fn fetch(req: &Request) -> Result<Vec<u8>, Error> {
+    let client = catalog_client()?;
     let ids = if req.associated {
         associated_ids(&client, req).await?
     } else {

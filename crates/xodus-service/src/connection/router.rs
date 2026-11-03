@@ -14,12 +14,14 @@ pub async fn route(
     tokens: Arc<TokenManager>,
     store_tokens: Arc<TokenManager>,
     entitlement: Option<Arc<crate::entitlement::Entitlement>>,
+    title: Option<crate::title::TitleIdentity>,
 ) {
     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
     tracing::debug!("Connection from pid {cred:?}");
 
     let mut context = SimpleContext::with_roles(device_token, store_tokens, tokens);
     context.entitlement = entitlement;
+    context.title = title;
     route_context(socket, token, context).await;
 }
 

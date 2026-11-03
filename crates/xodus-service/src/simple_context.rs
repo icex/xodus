@@ -7,6 +7,8 @@ use xodus::tokens::TokenManager;
 
 pub struct SimpleContext {
     pub entitlement: Option<Arc<crate::entitlement::Entitlement>>,
+    /// The title this service was started for, when the launcher said.
+    pub title: Option<crate::title::TitleIdentity>,
     pub client: reqwest::Client,
     pub device_token: Option<LegacyToken>,
     tokens: Arc<TokenManager>,
@@ -48,6 +50,7 @@ pub(crate) mod tests {
             .unwrap();
         SimpleContext {
             entitlement: None,
+            title: None,
             client: reqwest::Client::new(),
             device_token: None,
             tokens: Arc::new(gamer.pin_user().unwrap()),
@@ -100,6 +103,7 @@ impl SimpleContext {
         Self {
             client,
             entitlement: None,
+            title: None,
             device_token: Some(device_token),
             tokens,
             store_tokens,
@@ -113,10 +117,23 @@ impl SimpleContext {
     pub fn store_context(&self) -> Self {
         Self {
             entitlement: self.entitlement.clone(),
+            title: self.title.clone(),
             client: self.client.clone(),
             device_token: self.device_token.clone(),
             tokens: self.store_tokens.clone(),
             store_tokens: self.store_tokens.clone(),
+        }
+    }
+
+    /// Whether the Player's tokens are the Store account's: one account in
+    /// both roles, or a Store account that cannot be told apart from it.
+    pub fn player_is_store_account(&self) -> bool {
+        if Arc::ptr_eq(&self.tokens, &self.store_tokens) {
+            return true;
+        }
+        match (self.store_tokens.get_user(), self.tokens.get_user()) {
+            (Ok(store), Ok(player)) => store.puid.is_empty() || store.puid == player.puid,
+            _ => true,
         }
     }
 
