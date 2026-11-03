@@ -13,6 +13,36 @@ mod webview;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[command(
+        about = "Probe an authenticated Microsoft endpoint (research: owned-title enumeration)"
+    )]
+    Library {
+        #[arg(long, default_value_t = 100, help = "Page size for the collections query")]
+        page_size: u32,
+        #[arg(
+            long,
+            default_value = "www.microsoft.com",
+            help = "MSA ticket target; the licensing path uses www.microsoft.com"
+        )]
+        msa_target: String,
+        #[arg(long, default_value_t = false, help = "Keep add-ons, passes and inactive entitlements")]
+        all: bool,
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Raw probe of an authenticated Microsoft endpoint ({XUID} is substituted)")]
+    Collections {
+        #[clap(help = "Full URL to request")]
+        url: String,
+        #[arg(long, help = "JSON body; omitted means GET")]
+        body: Option<String>,
+        #[arg(
+            long,
+            default_value = "http://licensing.xboxlive.com",
+            help = "XSTS relying party (collections.mp.microsoft.com routes with licensing.xboxlive.com)"
+        )]
+        relying_party: String,
+    },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
         product: String,
@@ -240,6 +270,17 @@ async fn main() -> ExitCode {
             } => commands::clep::generate(smbios, disk_serial),
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
+        SubCommand::Collections {
+            url,
+            body,
+            relying_party,
+        } => commands::collections::probe(&client, &tokens, url, body, relying_party).await,
+        SubCommand::Library {
+            page_size,
+            msa_target,
+            all,
+            json,
+        } => commands::collections::query(&client, &tokens, page_size, msa_target, all, json).await,
         SubCommand::SpLicense { block } => commands::splicense::run(block),
     };
 
