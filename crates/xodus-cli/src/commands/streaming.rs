@@ -104,7 +104,20 @@ pub async fn run(
                 .iter()
                 .find(|p| p.file_name.ends_with(".msixvc"))
             else {
-                eprintln!("No .msixvc file found");
+                // Name what was there instead. Every Store product resolves to
+                // a package list; only some of those lists hold an XVD
+                // container. The rest are Appx/Msix packages -- ordinary OPC
+                // zips, or their encrypted E-prefixed variants -- which this
+                // streaming path cannot open, and "No .msixvc file found" reads
+                // as "the product is broken" rather than "it ships in another
+                // format".
+                eprintln!("No .msixvc file found. This product ships as:");
+                for f in &package.package_files {
+                    eprintln!("  {}", f.file_name);
+                }
+                if package.package_files.is_empty() {
+                    eprintln!("  (nothing at all -- the package list came back empty)");
+                }
                 return ExitCode::FAILURE;
             };
             format!(
@@ -332,7 +345,10 @@ where
         "open the download cache",
         streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await,
     );
-    let remote_xvd = or_stop("read the package header", XvdFile::parse(&mut remote_file).await);
+    let remote_xvd = or_stop(
+        "read the package header",
+        XvdFile::parse(&mut remote_file).await,
+    );
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 

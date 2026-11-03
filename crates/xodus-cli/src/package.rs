@@ -21,16 +21,32 @@ pub async fn get_content_id(
     let product_details = displaycatalog.product;
 
     let mut found_package = None;
+    let mut fallback_package = None;
     let mut subprods: Vec<String> = vec![];
     'o: for availability in &product_details.display_sku_availabilities {
         for package in &availability.sku.properties.packages {
-            if package
-                .platform_dependencies
-                .iter()
-                .any(|dep| dep.platform_name == "Windows.Desktop")
-            {
+            let platform = |name: &str| {
+                package
+                    .platform_dependencies
+                    .iter()
+                    .any(|dep| dep.platform_name == name)
+            };
+            if platform("Windows.Desktop") {
                 found_package = Some(package);
                 break 'o;
+            }
+            // A UWP product declares Windows.Universal (or, for the older ones,
+            // Windows.Windows8x) and no Windows.Desktop package at all. Taking
+            // only Desktop meant every such product fell through to the picker
+            // below -- which, in a launcher's non-interactive context, is not a
+            // picker but a failure reading "Selection failed".
+            //
+            // Second, not first: where a product ships both, the Desktop
+            // package is the one to fetch, and the loop above still wins.
+            if fallback_package.is_none()
+                && (platform("Windows.Universal") || platform("Windows.Windows8x"))
+            {
+                fallback_package = Some(package);
             }
         }
         for availability in &availability.availabilities {
@@ -49,7 +65,7 @@ pub async fn get_content_id(
     subprods.sort();
     subprods.dedup();
 
-    let Some(package) = found_package else {
+    let Some(package) = found_package.or(fallback_package) else {
         if !subprods.is_empty() {
             let Ok(item) = Select::new("Select files to download", subprods)
                 .with_page_size(30)
@@ -61,7 +77,8 @@ pub async fn get_content_id(
         }
 
         return Err(Box::new(std::io::Error::other(
-            "Windows.Desktop package not found, if you believe this is an error, please report it",
+            "no PC package found (Windows.Desktop, Windows.Universal or Windows.Windows8x); \
+             if you believe this is an error, please report it",
         )));
     };
 
