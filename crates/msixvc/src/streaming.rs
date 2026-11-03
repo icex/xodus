@@ -210,6 +210,8 @@ enum CacheWriteState {
     Idle,
     Seeking { offset: u64 },
     Writing,
+    /// Written, but not yet visible to the reader. See [`PrefixCacheFile`].
+    Flushing,
 }
 
 pub struct PrefixCacheFile<R> {
@@ -218,7 +220,21 @@ pub struct PrefixCacheFile<R> {
     pos: u64,
     cache_reader: File,
     cache_writer: File,
+    /// How much of the prefix is **on disk**, not how much has been handed to
+    /// the writer.
+    ///
+    /// The distinction is the whole correctness of this type. Reads come from
+    /// `cache_reader` and writes go through `cache_writer`, two handles on one
+    /// path, and `tokio::fs::File` buffers: `poll_write` returning `Ok(n)`
+    /// means n bytes were accepted, not that any syscall has happened. Counting
+    /// them here at that moment lets a read seek to an offset the file has not
+    /// reached, which comes back as zero bytes and is reported as
+    /// "cache ended before cached_len" -- a failed download, intermittently,
+    /// depending on whether the flush happened to have landed.
     cached_len: u64,
+    /// Accepted by the writer and not yet flushed. Added to `cached_len` only
+    /// once the flush completes.
+    unflushed: u64,
     pending_seek: Option<u64>,
     pending_chunk: Option<Vec<u8>>,
     pending_chunk_offset: usize,
@@ -255,6 +271,7 @@ where
             cache_reader,
             cache_writer,
             cached_len: 0,
+            unflushed: 0,
             pending_seek: None,
             pending_chunk: None,
             pending_chunk_offset: 0,
@@ -399,13 +416,35 @@ where
                         }
                         Poll::Ready(Ok(written)) => {
                             self.pending_chunk_offset += written;
-                            self.cached_len += written as u64;
+                            self.unflushed += written as u64;
                             self.cache_write_pos += written as u64;
                             if self.pending_chunk_offset >= chunk.len() {
-                                self.pending_chunk = None;
-                                self.pending_chunk_offset = 0;
-                                self.cache_write_state = CacheWriteState::Idle;
+                                // Not Idle, and `cached_len` deliberately not
+                                // advanced yet: the bytes are in a buffer, and
+                                // the reader is a different handle that cannot
+                                // see them until they reach the file.
+                                self.cache_write_state = CacheWriteState::Flushing;
+                                continue;
                             }
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Err(err)) => {
+                            self.cache_write_state = CacheWriteState::Idle;
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+                }
+                CacheWriteState::Flushing => {
+                    match AsyncWrite::poll_flush(Pin::new(&mut self.cache_writer), cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) => {
+                            // Now, and only now, is the prefix this long as far
+                            // as anything reading the file is concerned.
+                            self.cached_len += self.unflushed;
+                            self.unflushed = 0;
+                            self.pending_chunk = None;
+                            self.pending_chunk_offset = 0;
+                            self.cache_write_state = CacheWriteState::Idle;
                             return Poll::Ready(Ok(()));
                         }
                         Poll::Ready(Err(err)) => {
@@ -852,6 +891,35 @@ mod tests {
 
         assert_eq!(&buf[..], &body[..64]);
         assert!(file.cached_len() >= 64);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    /// The invariant the whole type rests on: `cached_len` counts bytes a
+    /// *different* handle can read, not bytes handed to a buffer.
+    ///
+    /// Breaking it produced an intermittent failed download -- a read would
+    /// seek inside the claimed prefix, get nothing, and report "cache ended
+    /// before cached_len". Checked against the file's real length on disk,
+    /// through a separate open, because that is exactly what the reader is.
+    #[tokio::test]
+    async fn cached_len_never_exceeds_what_is_on_disk() {
+        let body = test_body();
+        let server = spawn_server(body.clone(), None, 0).await.unwrap();
+        let cache = cache_path("durable-prefix");
+        let mut file = open_cached_reader(&server, &cache).await;
+
+        // Read in small pieces so the check runs many times across many writes:
+        // one big read would flush once and prove almost nothing.
+        let mut buf = [0u8; 16];
+        for _ in 0..16 {
+            file.read_exact(&mut buf).await.unwrap();
+            let on_disk = std::fs::metadata(&cache).unwrap().len();
+            assert!(
+                file.cached_len() <= on_disk,
+                "claimed {} cached with only {on_disk} in the file",
+                file.cached_len()
+            );
+        }
         let _ = std::fs::remove_file(cache);
     }
 
