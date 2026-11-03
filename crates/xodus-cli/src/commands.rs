@@ -1,3 +1,4 @@
+pub mod account;
 pub mod clep;
 pub mod collections;
 pub mod download;

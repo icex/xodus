@@ -32,7 +32,7 @@ const COLLECTIONS_QUERY: &str = "https://collections.mp.microsoft.com/v6.0/colle
 /// Mint an XSTS token for a relying party using the stored device and user
 /// tokens. Returns the token itself, because callers need its claims (the xuid
 /// identifies the beneficiary of a collections query) as well as the header.
-async fn xsts_for(
+pub(crate) async fn xsts_for(
     client: &reqwest::Client,
     tokens: &TokenManager,
     relying_party: &str,
@@ -52,21 +52,32 @@ fn correlation_vector() -> String {
     format!("{}.0", Uuid::new_v4().simple())
 }
 
-async fn send(
+pub(crate) async fn send(
     client: &reqwest::Client,
     url: &str,
     body: Option<String>,
     auth: &str,
+    extra: &[String],
 ) -> Result<(reqwest::StatusCode, String, String), String> {
     let cv = correlation_vector();
     let request = match &body {
         Some(json) => client.post(url).body(json.clone()),
         None => client.get(url),
     };
-    let response = request
+    let mut request = request
         .header("Authorization", auth)
         .header("Content-Type", "application/json")
-        .header("MS-CV", &cv)
+        .header("MS-CV", &cv);
+    // Not every XBL service takes the same shape. profile.xboxlive.com answers
+    // 401 -- not 400 -- without `x-xbl-contract-version`, which reads as an auth
+    // failure and sends you chasing the token instead of the header.
+    for header in extra {
+        let (name, value) = header
+            .split_once(':')
+            .ok_or_else(|| format!("--header wants NAME:VALUE, got {header:?}"))?;
+        request = request.header(name.trim(), value.trim());
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -84,6 +95,7 @@ pub async fn probe(
     url: String,
     body: Option<String>,
     relying_party: String,
+    headers: Vec<String>,
 ) -> ExitCode {
     let xsts = match xsts_for(client, tokens, &relying_party).await {
         Ok(xsts) => xsts,
@@ -107,7 +119,7 @@ pub async fn probe(
             .replace("{RAWTOKEN}", &raw_token)
     });
 
-    match send(client, &url, body, &auth).await {
+    match send(client, &url, body, &auth, &headers).await {
         Ok((status, text, cv)) => {
             eprintln!("HTTP {status}  (MS-CV {cv})");
             println!("{text}");
@@ -249,7 +261,7 @@ pub async fn query(
         }
 
         let (status, text, cv) =
-            match send(client, COLLECTIONS_QUERY, Some(body.to_string()), &auth).await {
+            match send(client, COLLECTIONS_QUERY, Some(body.to_string()), &auth, &[]).await {
                 Ok(result) => result,
                 Err(message) => {
                     eprintln!("{message}");

@@ -30,6 +30,11 @@ enum SubCommand {
         #[arg(long, default_value_t = false, help = "Emit JSON")]
         json: bool,
     },
+    #[command(about = "Show the signed-in account: gamertag, xuid and gamerpic")]
+    Account {
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
     #[command(about = "Raw probe of an authenticated Microsoft endpoint ({XUID} is substituted)")]
     Collections {
         #[clap(help = "Full URL to request")]
@@ -42,6 +47,12 @@ enum SubCommand {
             help = "XSTS relying party (collections.mp.microsoft.com routes with licensing.xboxlive.com)"
         )]
         relying_party: String,
+        #[arg(
+            long = "header",
+            value_name = "NAME:VALUE",
+            help = "Extra request header, repeatable (profile.xboxlive.com needs x-xbl-contract-version:3)"
+        )]
+        headers: Vec<String>,
     },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
@@ -270,11 +281,13 @@ async fn main() -> ExitCode {
             } => commands::clep::generate(smbios, disk_serial),
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
+        SubCommand::Account { json } => commands::account::run(&client, &tokens, json).await,
         SubCommand::Collections {
             url,
             body,
             relying_party,
-        } => commands::collections::probe(&client, &tokens, url, body, relying_party).await,
+            headers,
+        } => commands::collections::probe(&client, &tokens, url, body, relying_party, headers).await,
         SubCommand::Library {
             page_size,
             msa_target,
