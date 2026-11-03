@@ -102,3 +102,23 @@ mod title_tests {
         }
     }
 }
+
+/// XML IPC envelope. Custom data is base64 so XML cannot normalize or reject
+/// caller strings containing controls; JSON escaping belongs to the service.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LicenseTokenIpcRequest {
+    pub parent_product_id: String,
+    pub product_ids: LicenseProductIds,
+    pub custom_base64: String,
+    #[serde(default)]
+    pub title_id: String,
+    #[serde(default)]
+    pub title_client_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct LicenseProductIds {
+    #[serde(rename = "ProductId", default)]
+    pub ids: Vec<String>,
+}

@@ -346,6 +346,194 @@ fn sign_for_with(
     )
 }
 
+pub(super) async fn xsts_token(
+    context: &mut SimpleContext,
+    req: XSTSTokenRequest,
+) -> Result<XSTSTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::debug!("XSTS token request for {}", req.url);
+
+    // Read the persisted credential before any cache lookup: a logout
+    // invalidates access and a different login must never reuse an old identity.
+    let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
+        return Err("no signed-in credentials".into());
+    };
+    // STS refresh rotates credential bytes during ordinary SISU calls.
+    // Scope caches to the signed-in account, while requiring both its
+    // persisted identity and credentials to still exist after logout.
+    let account = context.tokens().get_user()?;
+    if account.puid.is_empty() {
+        return Err("signed-in account has no identity".into());
+    }
+    let session: [u8; 32] = Sha256::digest(account.puid.as_bytes()).into();
+    let title = req.title().map(|(id, client)| (id, client.to_string()));
+    let identity = match &title {
+        Some((id, client)) => {
+            identity_for(&context.client, context.tokens(), *id, client, session).await
+        }
+        None => None,
+    };
+    if title.is_some() && identity.is_none() {
+        return Err("the requested title identity could not be authenticated; retry later".into());
+    }
+    let issuer = match &identity {
+        Some(id) => xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
+            .ok_or("invalid title signing key")?,
+        None => SIGNER.clone(),
+    };
+    let mut endpoints = EndpointConfig {
+        default: endpoints_for(&context.client).await.unwrap_or(
+            xodus::models::xbox::TitleMgtResponse {
+                end_points: vec![],
+                signature_policies: vec![],
+            },
+        ),
+        title: None,
+    };
+    if let (Some((id, _)), Some(identity)) = (&title, &identity) {
+        match title_endpoints_for(&context.client, *id, identity).await {
+            Ok(list) => endpoints.title = Some(list),
+            Err(e) => tracing::warn!("title {id}: {e}"),
+        }
+    }
+    let relying_party = if req.relying_party.is_empty() {
+        endpoints.relying_party(&req.url)
+    } else {
+        req.relying_party.clone()
+    };
+    let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
+    let now = chrono::Utc::now().timestamp();
+    if let Some(hit) = XSTS_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&cache_key).cloned())
+        .filter(|c| c.expiry > now + 60)
+    {
+        let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
+        let payload = XSTSTokenResponse {
+            token: hit.token,
+            xuid: hit.xuid,
+            gamertag: hit.gamertag,
+            expiry: hit.expiry,
+            signature,
+        };
+        return Ok(payload);
+    }
+
+    let (xsts, signer) = if let Some(identity) = identity {
+        let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
+            .ok_or("invalid title signing key")?;
+        let refused = NO_TITLE_CLAIM
+            .lock()
+            .map(|s| s.contains(&cache_key))
+            .unwrap_or(false);
+        let result = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            xodus::api::xbox::request_xsts_token(
+                &context.client,
+                identity.user_token.clone(),
+                Some(identity.device_token.clone()),
+                if refused {
+                    None
+                } else {
+                    Some(identity.title_token.clone())
+                },
+                &relying_party,
+                Some(&signer),
+            ),
+        )
+        .await
+        .map_err(|_| "XSTS authorization timed out")?;
+        let xsts = match result {
+            Ok(token) => token,
+            Err(e)
+                if !refused
+                    && matches!(
+                        e.status(),
+                        Some(reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::FORBIDDEN)
+                    ) =>
+            {
+                // Some audiences accept the user/device chain only. Retry
+                // under the same key, scoped to this title and audience.
+                let token = tokio::time::timeout(
+                    AUTH_TIMEOUT,
+                    xodus::api::xbox::request_xsts_token(
+                        &context.client,
+                        identity.user_token.clone(),
+                        Some(identity.device_token.clone()),
+                        None,
+                        &relying_party,
+                        Some(&signer),
+                    ),
+                )
+                .await
+                .map_err(|_| "XSTS authorization without title claim timed out")?
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "XSTS authorization without title claim for {relying_party} failed: {e}"
+                    ))
+                })?;
+                tracing::warn!(
+                    "{relying_party} accepts this title's user/device token without a title claim"
+                );
+                if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
+                    set.insert(cache_key.clone());
+                }
+                token
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "XSTS authorization for {relying_party} failed: {e}"
+                ))
+                .into());
+            }
+        };
+        (xsts, signer)
+    } else {
+        let user_token = current_user;
+        let device_token = context
+            .device_token
+            .as_ref()
+            .ok_or("no device credentials")?
+            .clone();
+        let token = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            xodus::api::xbox::try_run_with_signer(
+                &context.client,
+                device_token,
+                user_token,
+                &relying_party,
+                Some(&SIGNER),
+            ),
+        )
+        .await
+        .map_err(|_| "unclaimed Xbox authentication timed out")?
+        .map_err(std::io::Error::other)?;
+        (token, SIGNER.clone())
+    };
+    let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+    let signature = sign_for_with(&req, &token, &endpoints, &signer);
+    let payload = XSTSTokenResponse {
+        xuid: xsts.xuid().unwrap_or_default().to_string(),
+        gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+        expiry: xsts.not_after.timestamp(),
+        token,
+        signature,
+    };
+    if let Ok(mut cache) = XSTS_CACHE.lock() {
+        cache.insert(
+            cache_key,
+            CachedToken {
+                signer,
+                token: payload.token.clone(),
+                xuid: payload.xuid.clone(),
+                gamertag: payload.gamertag.clone(),
+                expiry: payload.expiry,
+            },
+        );
+    }
+    Ok(payload)
+}
+
 pub async fn parse_message(
     context: &mut SimpleContext,
     message_type: XodusMessageType,
@@ -442,186 +630,26 @@ pub async fn parse_message(
         }
         XodusMessageType::XstsTokenRequest => {
             let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
-            tracing::debug!("XSTS token request for {}", req.url);
-
-            // Read the persisted credential before any cache lookup: a logout
-            // invalidates access and a different login must never reuse an old identity.
-            let Token::Legacy(current_user) = context.tokens().get_user_sts_token()? else {
-                return Ok(vec![]);
-            };
-            // STS refresh rotates credential bytes during ordinary SISU calls.
-            // Scope caches to the signed-in account, while requiring both its
-            // persisted identity and credentials to still exist after logout.
-            let account = context.tokens().get_user()?;
-            if account.puid.is_empty() {
-                return Err("signed-in account has no identity".into());
-            }
-            let session: [u8; 32] = Sha256::digest(account.puid.as_bytes()).into();
-            let title = req.title().map(|(id, client)| (id, client.to_string()));
-            let identity = match &title {
-                Some((id, client)) => {
-                    identity_for(&context.client, context.tokens(), *id, client, session).await
-                }
-                None => None,
-            };
-            if title.is_some() && identity.is_none() {
-                return Err(
-                    "the requested title identity could not be authenticated; retry later".into(),
-                );
-            }
-            let issuer = match &identity {
-                Some(id) => xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
-                    .ok_or("invalid title signing key")?,
-                None => SIGNER.clone(),
-            };
-            let mut endpoints = EndpointConfig {
-                default: endpoints_for(&context.client).await.unwrap_or(
-                    xodus::models::xbox::TitleMgtResponse {
-                        end_points: vec![],
-                        signature_policies: vec![],
-                    },
-                ),
-                title: None,
-            };
-            if let (Some((id, _)), Some(identity)) = (&title, &identity) {
-                match title_endpoints_for(&context.client, *id, identity).await {
-                    Ok(list) => endpoints.title = Some(list),
-                    Err(e) => tracing::warn!("title {id}: {e}"),
-                }
-            }
-            let relying_party = if req.relying_party.is_empty() {
-                endpoints.relying_party(&req.url)
-            } else {
-                req.relying_party.clone()
-            };
-            let cache_key = token_cache_key(&session, title.as_ref(), &relying_party, &issuer);
-            let now = chrono::Utc::now().timestamp();
-            if let Some(hit) = XSTS_CACHE
-                .lock()
-                .ok()
-                .and_then(|c| c.get(&cache_key).cloned())
-                .filter(|c| c.expiry > now + 60)
-            {
-                let signature = sign_for_with(&req, &hit.token, &endpoints, &hit.signer);
-                let payload = XSTSTokenResponse {
-                    token: hit.token,
-                    xuid: hit.xuid,
-                    gamertag: hit.gamertag,
-                    expiry: hit.expiry,
-                    signature,
-                };
-                return Ok(quick_xml::se::to_string(&payload)?.into_bytes());
-            }
-
-            let (xsts, signer) = if let Some(identity) = identity {
-                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&identity.key_pkcs8)
-                    .ok_or("invalid title signing key")?;
-                let refused = NO_TITLE_CLAIM
-                    .lock()
-                    .map(|s| s.contains(&cache_key))
-                    .unwrap_or(false);
-                let result = tokio::time::timeout(
-                    AUTH_TIMEOUT,
-                    xodus::api::xbox::request_xsts_token(
-                        &context.client,
-                        identity.user_token.clone(),
-                        Some(identity.device_token.clone()),
-                        if refused {
-                            None
-                        } else {
-                            Some(identity.title_token.clone())
-                        },
-                        &relying_party,
-                        Some(&signer),
-                    ),
-                )
-                .await
-                .map_err(|_| "XSTS authorization timed out")?;
-                let xsts = match result {
-                    Ok(token) => token,
-                    Err(e)
-                        if !refused
-                            && matches!(
-                                e.status(),
-                                Some(
-                                    reqwest::StatusCode::BAD_REQUEST
-                                        | reqwest::StatusCode::FORBIDDEN
-                                )
-                            ) =>
-                    {
-                        // Some audiences accept the user/device chain only. Retry
-                        // under the same key, scoped to this title and audience.
-                        let token = tokio::time::timeout(AUTH_TIMEOUT, xodus::api::xbox::request_xsts_token(
-                            &context.client,
-                            identity.user_token.clone(),
-                            Some(identity.device_token.clone()),
-                            None,
-                            &relying_party,
-                            Some(&signer),
-                        ))
-                        .await.map_err(|_| "XSTS authorization without title claim timed out")?
-                        .map_err(|e| std::io::Error::other(format!("XSTS authorization without title claim for {relying_party} failed: {e}")))?;
-                        tracing::warn!(
-                            "{relying_party} accepts this title's user/device token without a title claim"
-                        );
-                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
-                            set.insert(cache_key.clone());
-                        }
-                        token
-                    }
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "XSTS authorization for {relying_party} failed: {e}"
-                        ))
-                        .into());
-                    }
-                };
-                (xsts, signer)
-            } else {
-                let user_token = current_user;
-                let device_token = context
-                    .device_token
-                    .as_ref()
-                    .ok_or("no device credentials")?
-                    .clone();
-                let token = tokio::time::timeout(
-                    AUTH_TIMEOUT,
-                    xodus::api::xbox::try_run_with_signer(
-                        &context.client,
-                        device_token,
-                        user_token,
-                        &relying_party,
-                        Some(&SIGNER),
-                    ),
-                )
-                .await
-                .map_err(|_| "unclaimed Xbox authentication timed out")?
-                .map_err(std::io::Error::other)?;
-                (token, SIGNER.clone())
-            };
-            let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
-            let signature = sign_for_with(&req, &token, &endpoints, &signer);
-            let payload = XSTSTokenResponse {
-                xuid: xsts.xuid().unwrap_or_default().to_string(),
-                gamertag: xsts.gamertag().unwrap_or_default().to_string(),
-                expiry: xsts.not_after.timestamp(),
-                token,
-                signature,
-            };
-            if let Ok(mut cache) = XSTS_CACHE.lock() {
-                cache.insert(
-                    cache_key,
-                    CachedToken {
-                        signer,
-                        token: payload.token.clone(),
-                        xuid: payload.xuid.clone(),
-                        gamertag: payload.gamertag.clone(),
-                        expiry: payload.expiry,
-                    },
-                );
-            }
+            let payload = xsts_token(context, req).await?;
             Ok(quick_xml::se::to_string(&payload)?.into_bytes())
         }
+        XodusMessageType::LicenseTokenRequest => {
+            // This response is the raw, validated JWT; an empty frame is failure.
+            // Do not expose authorization headers or response bodies in diagnostics.
+            match tokio::time::timeout(
+                Duration::from_secs(45),
+                super::license::fetch(context, &buffer),
+            )
+            .await
+            {
+                Ok(Ok(token)) => Ok(token.into_bytes()),
+                _ => {
+                    tracing::warn!("license-token request failed");
+                    Ok(Vec::new())
+                }
+            }
+        }
+
         _ => Err("Unimplemented".into()),
     }
 }
