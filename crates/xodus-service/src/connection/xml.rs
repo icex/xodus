@@ -2,35 +2,146 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::Token;
 use xodus::models::soap;
-use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
+use xodus::models::xgameruntime::xuser::{
+    MSATokenRequest, MSATokenResponse, XSTSTokenRequest, XSTSTokenResponse,
+};
 use xodus::proto::xodus::XodusMessageType;
 
 use crate::XML_MAGIC;
 use crate::simple_context::SimpleContext;
 
+/// Tokens cached per relying party until shortly before they expire.
+///
+/// Minting one runs the whole MSA -> user token -> XSTS chain, several network
+/// round trips and a second or more. A title asks per request, so without this
+/// every marketplace page and profile fetch pays that cost again; the token is
+/// valid for a day, so there is nothing to gain by re-minting it.
+static XSTS_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, CachedToken>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Whether the one-off SISU run that yields a title token has been attempted.
+static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+/// The title-management endpoint list: which relying party each host
+/// authenticates against. It is static configuration, but fetching it is a
+/// network round trip -- and doing that per request cost more than minting the
+/// token did.
+static ENDPOINTS: tokio::sync::OnceCell<Option<xodus::models::xbox::TitleMgtResponse>> =
+    tokio::sync::OnceCell::const_new();
+
+/// One signing key for the life of the service. Tokens are minted bound to it
+/// (as ProofKey) and requests signed with it, so the two always agree.
+/// The identity SISU issued, if it would give us one: device, title and user
+/// tokens plus the key they are all bound to. Presence needs a title claim and
+/// Xbox will not let us mix keys, so when this is present it replaces the whole
+/// locally-built chain -- signing key included.
+static SISU: tokio::sync::OnceCell<Option<xodus::auth::SisuIdentity>> =
+    tokio::sync::OnceCell::const_new();
+
+/// The key that signs requests. It has to be the key the token was minted
+/// under, so it follows SISU when SISU supplied the tokens.
+static SIGNER: std::sync::LazyLock<xodus::api::xbox::RequestSigner> =
+    std::sync::LazyLock::new(xodus::api::xbox::RequestSigner::generate);
+
+/// The signature policy for a host, if it has one: the policy version and how
+/// much of the body is covered.
+fn signature_policy(
+    url: &str,
+    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
+) -> Option<(u32, usize)> {
+    let list = endpoints.as_ref()?;
+    let endpoint = xodus::api::xbox::title::get_endpoint(url, list).or_else(|| {
+        let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+        list.end_points
+            .iter()
+            .filter(|e| !e.host.contains('*') && host.ends_with(&format!(".{}", e.host)))
+            .max_by_key(|e| e.host.len())
+    })?;
+    let index = endpoint.signature_policy_index? as usize;
+    let policy = list.signature_policies.get(index)?;
+    Some((policy.version as u32, policy.max_body_bytes as usize))
+}
+
+#[derive(Clone)]
+struct CachedToken {
+    token: String,
+    xuid: String,
+    gamertag: String,
+    expiry: i64,
+}
+
 pub async fn handle(
     socket: &mut tokio::net::UnixStream,
     context: &mut SimpleContext,
 ) -> tokio::io::Result<()> {
-    log::debug!("Parsing XML");
+    tracing::debug!("Parsing XML");
     let message_type = socket.read_u16_le().await?;
     let message_size = socket.read_u16_le().await?;
     let mut buffer = vec![0; message_size as usize];
-    log::debug!("Reading buffer {message_size}");
+    tracing::debug!("Reading buffer {message_size}");
     socket.read_exact(&mut buffer).await?;
-    log::debug!("Read buffer");
+    tracing::debug!("Read buffer");
     let message_type = XodusMessageType::try_from(message_type as i32).unwrap_or_default();
 
     let out_buf = match parse_message(context, message_type, buffer).await {
         Ok(buf) => buf,
         Err(err) => {
-            log::error!("Failed parsing message: {err}");
+            tracing::error!("Failed parsing message: {err}");
             vec![]
         }
     };
 
     let data = super::encode_message(XML_MAGIC, message_type as u16 + 1, out_buf);
     socket.write_all(&data).await
+}
+
+async fn endpoints_for(
+    client: &reqwest::Client,
+) -> Option<xodus::models::xbox::TitleMgtResponse> {
+    ENDPOINTS
+        .get_or_init(|| async {
+            xodus::api::xbox::title::get_title_management(client).await.ok()
+        })
+        .await
+        .clone()
+}
+
+/// Sign the caller's request, if its endpoint demands one.
+fn sign_for(
+    req: &XSTSTokenRequest,
+    authorization: &str,
+    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
+) -> String {
+    sign_for_with(req, authorization, endpoints, &SIGNER)
+}
+
+/// As `sign_for`, but with the key the token was actually minted under: a
+/// signature made with any other key is rejected.
+fn sign_for_with(
+    req: &XSTSTokenRequest,
+    authorization: &str,
+    endpoints: &Option<xodus::models::xbox::TitleMgtResponse>,
+    signer: &xodus::api::xbox::RequestSigner,
+) -> String {
+    let Some((version, max_body)) = signature_policy(&req.url, endpoints) else {
+        return String::new();
+    };
+    let body = if req.body_base64.is_empty() {
+        Vec::new()
+    } else {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.body_base64)
+            .unwrap_or_default()
+    };
+    let method = if req.method.is_empty() { "GET" } else { &req.method };
+    signer.sign(
+        version,
+        method,
+        &xodus::api::xbox::path_and_query(&req.url),
+        authorization,
+        &body,
+        max_body,
+    )
 }
 
 pub async fn parse_message(
@@ -41,9 +152,9 @@ pub async fn parse_message(
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
         XodusMessageType::MsaTokenRequest => {
-            log::debug!("Raw buffer: {buffer:?}");
+            tracing::debug!("Raw buffer: {buffer:?}");
             let string_buf = std::str::from_utf8(&buffer)?;
-            log::debug!("String buffer: {string_buf:?}");
+            tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
             let Token::Legacy(token) = context.tokens().get_user_sts_token()? else {
                 return Ok(vec![]);
@@ -104,7 +215,7 @@ pub async fn parse_message(
                             address
                         };
                         if let Err(err) = context.tokens().save_user_token(address, sts) {
-                            log::warn!("Failed to persist refreshed STS token: {err}");
+                            tracing::warn!("Failed to persist refreshed STS token: {err}");
                         }
                     }
                     let token = collection.security_tokens.remove(0);
@@ -126,6 +237,238 @@ pub async fn parse_message(
                 }
                 _ => todo!("Error handling sill sucks"),
             }
+        }
+        XodusMessageType::XstsTokenRequest => {
+            let req = quick_xml::de::from_str::<XSTSTokenRequest>(std::str::from_utf8(&buffer)?)?;
+            tracing::debug!("XSTS token request for {}", req.url);
+
+            // Which relying party this URL authenticates against. The
+            // title-management endpoint list is authoritative; its PlayFab entry
+            // is the bare domain, so fall back to a suffix match for the
+            // per-title hosts (b980a380.minecraft.playfabapi.com and friends).
+            let relying_party = if !req.relying_party.is_empty() {
+                req.relying_party.clone()
+            } else {
+                let endpoints = ENDPOINTS
+                    .get_or_init(|| async {
+                        xodus::api::xbox::title::get_title_management(&context.client)
+                            .await
+                            .ok()
+                    })
+                    .await;
+                let from_list = endpoints.as_ref().and_then(|list| {
+                    xodus::api::xbox::title::get_endpoint(&req.url, list)
+                        .and_then(|e| e.relying_party.clone())
+                });
+                match from_list {
+                    Some(rp) => rp,
+                    None => {
+                        let host = reqwest::Url::parse(&req.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        let fallback = endpoints.as_ref().and_then(|list| {
+                            list.end_points
+                                .iter()
+                                .filter(|e| {
+                                    e.relying_party.is_some()
+                                        && !e.host.contains('*')
+                                        && host.ends_with(&format!(".{}", e.host))
+                                })
+                                .max_by_key(|e| e.host.len())
+                                .and_then(|e| e.relying_party.clone())
+                        });
+                        // A service Xbox does not list still has a relying
+                        // party: its own origin. Minecraft Realms is the case
+                        // in point -- the title asks for a token for
+                        // pocket.realms.minecraft.net, which is not an
+                        // xboxlive.com host, and handing it an xboxlive.com
+                        // token made every Realms endpoint answer 401.
+                        fallback.unwrap_or_else(|| {
+                            reqwest::Url::parse(&req.url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(|h| format!("https://{h}/")))
+                                .unwrap_or_else(|| "http://xboxlive.com".to_string())
+                        })
+                    }
+                }
+            };
+            tracing::debug!("Relying party: {relying_party}");
+
+            // Re-use a still-valid token rather than paying for the whole
+            // chain again; keep a minute of headroom so one never expires in
+            // flight.
+            let now = chrono::Utc::now().timestamp();
+            if let Some(hit) = XSTS_CACHE
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&relying_party).cloned())
+                .filter(|c| c.expiry > now + 60)
+            {
+                tracing::debug!("Re-using cached token for {relying_party}");
+                let signature = sign_for(&req, &hit.token, &endpoints_for(&context.client).await);
+                let payload = XSTSTokenResponse {
+                    token: hit.token,
+                    xuid: hit.xuid,
+                    gamertag: hit.gamertag,
+                    expiry: hit.expiry,
+                    signature,
+                };
+                return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
+            }
+
+            let Token::Legacy(user_token) = context.tokens().get_user_sts_token()? else {
+                return Ok(vec![]);
+            };
+
+            // Xbox will only issue a title token against an RPS ticket obtained
+            // under the title's own client id, which is why title/authenticate
+            // answers 403 for the generic ticket the token path holds. SISU does
+            // hold one, so run it once and hand the title token over: presence
+            // resolves `titles/current` from that claim and fails without it.
+            // Off unless asked for: the token SISU returns is bound to its own
+            // proof key, while the user and device tokens here are bound to
+            // ours, and xsts/authorize answers 400 to that mixture. Presence
+            // needs the whole chain minted under one key, which is a rebuild of
+            // this path rather than an addition to it.
+            if std::env::var("XODUS_TITLE_TOKEN").is_ok_and(|v| v == "1") {
+            TITLE_TOKEN
+                .get_or_init(|| async {
+                    match xodus::auth::do_sisu(
+                        &context.client,
+                        context.tokens(),
+                        "0000000040159362",
+                        896928775,
+                    )
+                    .await
+                    {
+                        Ok((_, resp, _)) => {
+                            tracing::info!("SISU supplied a title token");
+                            xodus::api::xbox::set_title_token(resp.title_token.token.clone());
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!("SISU title token unavailable: {e}");
+                            false
+                        }
+                    }
+                })
+                .await;
+            }
+            let device_token = context.device_token.as_ref().unwrap().clone();
+
+            let sisu = SISU
+                .get_or_init(|| async {
+                    match xodus::auth::sisu_identity(&context.client, context.tokens()).await {
+                        Ok(id) => {
+                            tracing::info!("SISU issued a device, title and user token set");
+                            Some(id)
+                        }
+                        Err(e) => {
+                            tracing::warn!("{e}; falling back to a user-only chain");
+                            None
+                        }
+                    }
+                })
+                .await;
+
+            if let Some(id) = sisu.as_ref() {
+                let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8);
+                let xsts = xodus::api::xbox::request_xsts_token(
+                    &context.client,
+                    id.user_token.clone(),
+                    Some(id.device_token.clone()),
+                    Some(id.title_token.clone()),
+                    &relying_party,
+                )
+                .await;
+                match xsts {
+                    Ok(xsts) => {
+                        let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+                        let signature = match signer.as_ref() {
+                            Some(s) => sign_for_with(&req, &token, &endpoints_for(&context.client).await, s),
+                            None => String::new(),
+                        };
+                        let payload = XSTSTokenResponse {
+                            xuid: xsts.xuid().unwrap_or_default().to_string(),
+                            gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+                            expiry: xsts.not_after.timestamp(),
+                            token,
+                            signature,
+                        };
+                        if let Ok(mut cache) = XSTS_CACHE.lock() {
+                            cache.insert(
+                                relying_party.clone(),
+                                CachedToken {
+                                    token: payload.token.clone(),
+                                    xuid: payload.xuid.clone(),
+                                    gamertag: payload.gamertag.clone(),
+                                    expiry: payload.expiry,
+                                },
+                            );
+                        }
+                        return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
+                    }
+                    Err(e) => {
+                        tracing::warn!("SISU-based XSTS failed for {relying_party}: {e}");
+                    }
+                }
+            }
+
+            // A refused relying party used to panic the task serving this
+            // request, leaving the title waiting for a token for ever. Report
+            // it instead, and try the generic Xbox audience before giving up.
+            let xsts = match xodus::api::xbox::try_run_with_signer(
+                &context.client,
+                device_token.clone(),
+                user_token.clone(),
+                &relying_party,
+                Some(&SIGNER),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("{e}; retrying with the generic Xbox audience");
+                    match xodus::api::xbox::try_run_with_signer(
+                        &context.client,
+                        device_token,
+                        user_token,
+                        "http://xboxlive.com",
+                        Some(&SIGNER),
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!("no token for {}: {e}", req.url);
+                            return Ok(vec![]);
+                        }
+                    }
+                }
+            };
+
+            let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
+            let signature = sign_for(&req, &token, &endpoints_for(&context.client).await);
+            let payload = XSTSTokenResponse {
+                xuid: xsts.xuid().unwrap_or_default().to_string(),
+                gamertag: xsts.gamertag().unwrap_or_default().to_string(),
+                expiry: xsts.not_after.timestamp(),
+                token,
+                signature,
+            };
+            if let Ok(mut cache) = XSTS_CACHE.lock() {
+                cache.insert(
+                    relying_party.clone(),
+                    CachedToken {
+                        token: payload.token.clone(),
+                        xuid: payload.xuid.clone(),
+                        gamertag: payload.gamertag.clone(),
+                        expiry: payload.expiry,
+                    },
+                );
+            }
+            Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec())
         }
         _ => Err("Unimplemented".into()),
     }

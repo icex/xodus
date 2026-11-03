@@ -147,7 +147,7 @@ pub async fn do_sisu(
             address
         };
         if let Err(err) = manager.save_user_token(address, sts) {
-            log::warn!("Failed to persist refreshed STS token: {err}");
+            tracing::warn!("Failed to persist refreshed STS token: {err}");
         }
     }
     let token: soap::RequestSecurityTokenResponse = collection.security_tokens.remove(0);
@@ -200,4 +200,44 @@ async fn test_minecraft_win_auth() {
     println!("title {}", resp.title_token.token);
     println!("user {}", resp.user_token.token);
     println!("webpage {}", resp.web_page);
+}
+
+/// Everything a title needs to authenticate, all bound to one signing key.
+///
+/// Xbox refuses to mix keys: a title token minted under one key and a user
+/// token minted under another makes xsts/authorize answer 400, and
+/// title/authenticate will not issue a title token to this path's own ticket
+/// at all (403). SISU issues device, title and user tokens together under a
+/// single key, so the way to get a title claim is to take that whole set --
+/// and its key, which then has to sign our requests too.
+pub struct SisuIdentity {
+    pub key_pkcs8: Vec<u8>,
+    pub device_token: String,
+    pub title_token: String,
+    pub user_token: String,
+}
+
+pub async fn sisu_identity(
+    client: &Client,
+    manager: &TokenManager,
+) -> Result<SisuIdentity, String> {
+    use p256::pkcs8::EncodePrivateKey;
+
+    let (auth, resp, device) = do_sisu(client, manager, "0000000040159362", 896928775)
+        .await
+        .map_err(|e| format!("SISU failed: {e}"))?;
+
+    let key = auth.request_signer().keypair;
+    let key_pkcs8 = key
+        .to_pkcs8_der()
+        .map_err(|e| format!("could not export the SISU signing key: {e}"))?
+        .as_bytes()
+        .to_vec();
+
+    Ok(SisuIdentity {
+        key_pkcs8,
+        device_token: device.token,
+        title_token: resp.title_token.token,
+        user_token: resp.user_token.token,
+    })
 }

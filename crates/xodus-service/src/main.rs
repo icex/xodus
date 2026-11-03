@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use xodus::tokens::TokenManager;
 
 mod connection;
@@ -15,6 +18,26 @@ const PROTO_MAGIC: u32 = 0x58445350;
 
 #[tokio::main]
 async fn main() {
+    let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
+    let registry =
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+
+    #[cfg(feature = "tokio_console")]
+    {
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::filter::Targets;
+
+        let console_filter = Targets::new()
+            .with_target("tokio", LevelFilter::TRACE)
+            .with_target("runtime", LevelFilter::TRACE);
+        let console_layer = console_subscriber::spawn().with_filter(console_filter);
+        registry.with(console_layer).init();
+    }
+    #[cfg(not(feature = "tokio_console"))]
+    {
+        registry.init();
+    }
+
     xodus::secrets::init_secrets().expect("Failed to init keychain");
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
@@ -24,7 +47,6 @@ async fn main() {
         panic!("Device token isnt legacy")
     };
 
-    env_logger::init_from_env("XODUS_LOG");
     let runtime_dir = utils::get_runtime_dir();
     let cancellation = CancellationToken::new();
     let socket_path = format!("{runtime_dir}/xodus.sock");
