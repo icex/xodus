@@ -18,7 +18,15 @@ const PROTO_MAGIC: u32 = 0x58445350;
 
 #[tokio::main]
 async fn main() {
-    let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
+    // Default to info rather than to the EnvFilter's own error-only default.
+    // The service's log is the only place the reason a title's Xbox call was
+    // refused ever appears -- the title itself just sees the 403 -- and a log
+    // that stays silent until someone knows to set XODUS_LOG is a log nobody
+    // reads at the moment it would have helped.
+    let filter = match std::env::var("XODUS_LOG") {
+        Ok(value) if !value.trim().is_empty() => tracing_subscriber::EnvFilter::new(value),
+        _ => tracing_subscriber::EnvFilter::new("info"),
+    };
     let registry =
         tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
 

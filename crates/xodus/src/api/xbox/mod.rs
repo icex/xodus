@@ -4,6 +4,7 @@ use crate::models::soap;
 use crate::models::xbox::XstsResponse;
 
 pub mod auth;
+pub mod claims;
 pub mod signing;
 pub mod title;
 pub use auth::{

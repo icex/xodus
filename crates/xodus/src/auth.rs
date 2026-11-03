@@ -217,13 +217,35 @@ pub struct SisuIdentity {
     pub user_token: String,
 }
 
+/// The Xbox app's own identity: a title claim, but for the Xbox app rather than
+/// for whatever is running. Services that only ask "is there a title claim at
+/// all" accept it; services that check *which* title do not.
+pub const XBOX_APP_CLIENT_ID: &str = "0000000040159362";
+pub const XBOX_APP_TITLE_ID: i64 = 896928775;
+
 pub async fn sisu_identity(
     client: &Client,
     manager: &TokenManager,
 ) -> Result<SisuIdentity, String> {
+    sisu_identity_for(client, manager, XBOX_APP_CLIENT_ID, XBOX_APP_TITLE_ID).await
+}
+
+/// The same set, but claiming a particular title.
+///
+/// `client_id` is the title's `MSAAppId` and `title_id` its `TitleId`, both
+/// out of its `MicrosoftGame.config`. Xbox mints the title claim from the pair,
+/// and a service that scopes what it returns by title -- presence's
+/// `titles/current`, the session directory -- answers 403 to a claim naming a
+/// different title just as it does to no claim at all.
+pub async fn sisu_identity_for(
+    client: &Client,
+    manager: &TokenManager,
+    client_id: &str,
+    title_id: i64,
+) -> Result<SisuIdentity, String> {
     use p256::pkcs8::EncodePrivateKey;
 
-    let (auth, resp, device) = do_sisu(client, manager, "0000000040159362", 896928775)
+    let (auth, resp, device) = do_sisu(client, manager, client_id, title_id)
         .await
         .map_err(|e| format!("SISU failed: {e}"))?;
 

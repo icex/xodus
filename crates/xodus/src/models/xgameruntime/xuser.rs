@@ -35,6 +35,26 @@ pub struct XSTSTokenRequest {
     pub method: String,
     #[serde(default)]
     pub body_base64: String,
+    /// The running title, out of its `MicrosoftGame.config`: `TitleId` in
+    /// decimal and `MSAAppId`. Xbox mints the token's *title claim* from the
+    /// pair, and services that scope by title -- presence's `titles/current`,
+    /// the session directory -- refuse a claim naming a different title exactly
+    /// as they refuse none. Empty when an older runtime is on the other end.
+    #[serde(default)]
+    pub title_id: String,
+    #[serde(default)]
+    pub title_client_id: String,
+}
+
+impl XSTSTokenRequest {
+    /// The title this request is on behalf of, when it named one.
+    pub fn title(&self) -> Option<(i64, &str)> {
+        if self.title_client_id.is_empty() {
+            return None;
+        }
+        let id = self.title_id.parse::<i64>().ok().filter(|id| *id > 0)?;
+        Some((id, self.title_client_id.as_str()))
+    }
 }
 
 /// The `XBL3.0 x=<uhs>;<token>` header a title puts on its request, plus the

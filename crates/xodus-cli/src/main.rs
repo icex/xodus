@@ -53,6 +53,30 @@ enum SubCommand {
             help = "Extra request header, repeatable (profile.xboxlive.com needs x-xbl-contract-version:3)"
         )]
         headers: Vec<String>,
+        #[arg(
+            long,
+            value_name = "TITLEID",
+            help = "Mint the token with a title claim for this decimal TitleId (needs --title-client-id)"
+        )]
+        title_id: Option<i64>,
+        #[arg(
+            long,
+            value_name = "GUID",
+            help = "The title's MSAAppId, from its MicrosoftGame.config"
+        )]
+        title_client_id: Option<String>,
+    },
+    #[command(
+        name = "xbl-check",
+        about = "Check that a title's Xbox Live calls will be authorised (multiplayer, presence)"
+    )]
+    XblCheck {
+        #[arg(help = "The installed game directory holding MicrosoftGame.config")]
+        game_dir: Option<std::path::PathBuf>,
+        #[arg(long, help = "Decimal TitleId, instead of reading the game directory")]
+        title_id: Option<i64>,
+        #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
+        title_client_id: Option<String>,
     },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
@@ -282,12 +306,49 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::Account { json } => commands::account::run(&client, &tokens, json).await,
+        SubCommand::XblCheck {
+            game_dir,
+            title_id,
+            title_client_id,
+        } => {
+            let identity = match (title_id.zip(title_client_id), game_dir) {
+                (Some((title_id, client_id)), _) => Ok(commands::xblcheck::TitleIdentity {
+                    title_id,
+                    client_id,
+                }),
+                (None, Some(dir)) => commands::xblcheck::identity_from_game_dir(&dir),
+                (None, None) => Err(
+                    "give the installed game directory, or --title-id with --title-client-id"
+                        .to_string(),
+                ),
+            };
+            match identity {
+                Ok(identity) => commands::xblcheck::run(&client, &tokens, identity).await,
+                Err(message) => {
+                    eprintln!("{message}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
         SubCommand::Collections {
             url,
             body,
             relying_party,
             headers,
-        } => commands::collections::probe(&client, &tokens, url, body, relying_party, headers).await,
+            title_id,
+            title_client_id,
+        } => {
+            commands::collections::probe(
+                &client,
+                &tokens,
+                url,
+                body,
+                relying_party,
+                headers,
+                title_id.zip(title_client_id),
+            )
+            .await
+        }
         SubCommand::Library {
             page_size,
             msa_target,

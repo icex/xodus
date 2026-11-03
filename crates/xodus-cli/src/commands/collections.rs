@@ -46,6 +46,31 @@ pub(crate) async fn xsts_for(
     Ok(xodus::api::xbox::run(client, dev_token, user_token, relying_party).await)
 }
 
+/// Mint an XSTS token carrying a title claim for `title_id`.
+///
+/// The whole chain has to come from SISU: Xbox will not issue a title token
+/// against the ticket this client holds, and it rejects a request that mixes a
+/// title token minted under one proof key with a user token minted under
+/// another. `xodus::auth::sisu_identity_for` returns the matching set.
+pub(crate) async fn title_claim_xsts(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+    client_id: &str,
+    title_id: i64,
+    relying_party: &str,
+) -> Result<XstsResponse, String> {
+    let id = xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await?;
+    xodus::api::xbox::request_xsts_token(
+        client,
+        id.user_token,
+        Some(id.device_token),
+        Some(id.title_token),
+        relying_party,
+    )
+    .await
+    .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))
+}
+
 fn correlation_vector() -> String {
     // These services want an MS-CV, and it is the identifier support would ask
     // for if a call misbehaves.
@@ -96,8 +121,18 @@ pub async fn probe(
     body: Option<String>,
     relying_party: String,
     headers: Vec<String>,
+    // (TitleId, MSAAppId) when the caller wants a title claim in the token.
+    title: Option<(i64, String)>,
 ) -> ExitCode {
-    let xsts = match xsts_for(client, tokens, &relying_party).await {
+    let minted = match &title {
+        Some((title_id, client_id)) => {
+            title_claim_xsts(client, tokens, client_id, *title_id, &relying_party)
+                .await
+                .map_err(|e| format!("{e}"))
+        }
+        None => xsts_for(client, tokens, &relying_party).await,
+    };
+    let xsts = match minted {
         Ok(xsts) => xsts,
         Err(message) => {
             eprintln!("{message}");
@@ -111,13 +146,17 @@ pub async fn probe(
     let puid = tokens.get_user().map(|u| u.puid).unwrap_or_default();
     let raw_token = xsts.token.clone();
     let auth = xodus::api::xbox::get_xsts_auth_header(xsts);
-    let body = body.map(|b| {
-        b.replace("{XUID}", &xuid)
+    let fill = |text: &str| {
+        text.replace("{XUID}", &xuid)
             .replace("{UHS}", &uhs)
             .replace("{PUID}", &puid)
             .replace("{XTOKEN}", &auth)
             .replace("{RAWTOKEN}", &raw_token)
-    });
+    };
+    // The path carries the xuid as often as the body does -- presence and
+    // social are both /users/xuid(...) -- so substitute in both.
+    let url = fill(&url);
+    let body = body.as_deref().map(fill);
 
     match send(client, &url, body, &auth, &headers).await {
         Ok((status, text, cv)) => {
@@ -181,7 +220,9 @@ async fn msa_user_ticket(
     let Ok(Token::Legacy(user_legacy)) = tokens.get_user_sts_token() else {
         return Err("no usable user token".into());
     };
-    let user = tokens.get_user().map_err(|e| format!("no stored user: {e}"))?;
+    let user = tokens
+        .get_user()
+        .map_err(|e| format!("no stored user: {e}"))?;
 
     let outcome = xodus::api::live::exchange_user_token(
         client,
@@ -208,7 +249,9 @@ async fn msa_user_ticket(
     };
     match token {
         Token::Compact(ticket) => Ok(ticket),
-        Token::Legacy(_) => Err("MSA exchange returned a legacy token, wanted a compact one".into()),
+        Token::Legacy(_) => {
+            Err("MSA exchange returned a legacy token, wanted a compact one".into())
+        }
     }
 }
 
@@ -260,14 +303,21 @@ pub async fn query(
             body["continuationToken"] = serde_json::Value::String(token.clone());
         }
 
-        let (status, text, cv) =
-            match send(client, COLLECTIONS_QUERY, Some(body.to_string()), &auth, &[]).await {
-                Ok(result) => result,
-                Err(message) => {
-                    eprintln!("{message}");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let (status, text, cv) = match send(
+            client,
+            COLLECTIONS_QUERY,
+            Some(body.to_string()),
+            &auth,
+            &[],
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        };
         if !status.is_success() {
             eprintln!("HTTP {status} (MS-CV {cv})");
             println!("{text}");
@@ -294,8 +344,7 @@ pub async fn query(
     if !all {
         entries.retain(|item| {
             let field = |name: &str| item.get(name).and_then(|v| v.as_str()).unwrap_or_default();
-            field("status") == "Active"
-                && matches!(field("productType"), "Game" | "Application")
+            field("status") == "Active" && matches!(field("productType"), "Game" | "Application")
         });
     }
 

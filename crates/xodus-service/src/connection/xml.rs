@@ -30,14 +30,73 @@ static TITLE_TOKEN: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_n
 static ENDPOINTS: tokio::sync::OnceCell<Option<xodus::models::xbox::TitleMgtResponse>> =
     tokio::sync::OnceCell::const_new();
 
-/// One signing key for the life of the service. Tokens are minted bound to it
-/// (as ProofKey) and requests signed with it, so the two always agree.
-/// The identity SISU issued, if it would give us one: device, title and user
-/// tokens plus the key they are all bound to. Presence needs a title claim and
-/// Xbox will not let us mix keys, so when this is present it replaces the whole
-/// locally-built chain -- signing key included.
-static SISU: tokio::sync::OnceCell<Option<xodus::auth::SisuIdentity>> =
-    tokio::sync::OnceCell::const_new();
+/// The identity SISU issued for a title: device, title and user tokens plus the
+/// key they are all bound to. Xbox will not let us mix keys, so when this is
+/// present it replaces the whole locally-built chain -- signing key included.
+///
+/// Keyed by title, because the claim it carries *names* a title. A token
+/// claiming the wrong one is not a weaker token, it is a refused one: the
+/// session directory answers "The requested service config cannot be accessed."
+/// and presence's titles/current answers 403, while the same request with no
+/// claim at all goes through. Handing every title the Xbox app's identity --
+/// which is what this used to do -- therefore broke exactly the two services a
+/// title needs it for.
+///
+/// The mutex is held across the mint so a title asking for several relying
+/// parties at once runs SISU once rather than once per ask.
+static SISU: std::sync::LazyLock<
+    tokio::sync::Mutex<
+        std::collections::HashMap<i64, Option<std::sync::Arc<xodus::auth::SisuIdentity>>>,
+    >,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Relying parties xsts/authorize refused a title token for.
+///
+/// Rather than carry a list of which audiences accept a title claim -- which
+/// would be wrong the moment Xbox changes one -- try it and remember the
+/// answer. The retry without the claim happens on the same request, so a
+/// refusal costs one extra round trip, once.
+static NO_TITLE_CLAIM: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Mint (or reuse) the SISU identity for one title.
+///
+/// The SOAP exchange behind it fails intermittently -- an empty or truncated
+/// response deserialises as a missing `wst:TokenType` -- and a failure here
+/// costs the title its multiplayer, so a second attempt is worth more than the
+/// second or so it takes.
+async fn sisu_for(
+    client: &reqwest::Client,
+    tokens: &xodus::tokens::TokenManager,
+    title_id: i64,
+    client_id: &str,
+) -> Option<std::sync::Arc<xodus::auth::SisuIdentity>> {
+    let mut cache = SISU.lock().await;
+    if let Some(hit) = cache.get(&title_id) {
+        return hit.clone();
+    }
+    let mut last = String::new();
+    for attempt in 1..=2 {
+        match xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await {
+            Ok(id) => {
+                tracing::info!("SISU issued a token set claiming title {title_id}");
+                let id = std::sync::Arc::new(id);
+                cache.insert(title_id, Some(id.clone()));
+                return Some(id);
+            }
+            Err(e) => {
+                tracing::warn!("SISU attempt {attempt} for title {title_id} failed: {e}");
+                last = e;
+            }
+        }
+    }
+    tracing::error!(
+        "no title claim for title {title_id} (client id {client_id}): {last}. \
+         Presence and multiplayer will answer 403 until this succeeds."
+    );
+    cache.insert(title_id, None);
+    None
+}
 
 /// The key that signs requests. It has to be the key the token was minted
 /// under, so it follows SISU when SISU supplied the tokens.
@@ -96,12 +155,12 @@ pub async fn handle(
     socket.write_all(&data).await
 }
 
-async fn endpoints_for(
-    client: &reqwest::Client,
-) -> Option<xodus::models::xbox::TitleMgtResponse> {
+async fn endpoints_for(client: &reqwest::Client) -> Option<xodus::models::xbox::TitleMgtResponse> {
     ENDPOINTS
         .get_or_init(|| async {
-            xodus::api::xbox::title::get_title_management(client).await.ok()
+            xodus::api::xbox::title::get_title_management(client)
+                .await
+                .ok()
         })
         .await
         .clone()
@@ -133,7 +192,11 @@ fn sign_for_with(
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.body_base64)
             .unwrap_or_default()
     };
-    let method = if req.method.is_empty() { "GET" } else { &req.method };
+    let method = if req.method.is_empty() {
+        "GET"
+    } else {
+        &req.method
+    };
     signer.sign(
         version,
         method,
@@ -293,7 +356,23 @@ pub async fn parse_message(
                     }
                 }
             };
-            tracing::debug!("Relying party: {relying_party}");
+            // Which title is asking, when the runtime told us. Everything
+            // below keys off it: two titles running at once must not be handed
+            // each other's claim, and neither must a title be handed the
+            // claimless token minted before its own arrived.
+            let title = req.title().map(|(id, client)| (id, client.to_string()));
+            match &title {
+                Some((id, client)) => {
+                    tracing::debug!("Relying party: {relying_party} (title {id}, client {client})")
+                }
+                None => {
+                    tracing::debug!("Relying party: {relying_party} (no title claim asked for)")
+                }
+            }
+            let cache_key = format!(
+                "{}|{relying_party}",
+                title.as_ref().map(|(id, _)| *id).unwrap_or(0)
+            );
 
             // Re-use a still-valid token rather than paying for the whole
             // chain again; keep a minute of headroom so one never expires in
@@ -302,7 +381,7 @@ pub async fn parse_message(
             if let Some(hit) = XSTS_CACHE
                 .lock()
                 .ok()
-                .and_then(|c| c.get(&relying_party).cloned())
+                .and_then(|c| c.get(&cache_key).cloned())
                 .filter(|c| c.expiry > now + 60)
             {
                 tracing::debug!("Re-using cached token for {relying_party}");
@@ -332,45 +411,65 @@ pub async fn parse_message(
             // needs the whole chain minted under one key, which is a rebuild of
             // this path rather than an addition to it.
             if std::env::var("XODUS_TITLE_TOKEN").is_ok_and(|v| v == "1") {
-            TITLE_TOKEN
-                .get_or_init(|| async {
-                    match xodus::auth::do_sisu(
-                        &context.client,
-                        context.tokens(),
-                        "0000000040159362",
-                        896928775,
-                    )
-                    .await
-                    {
-                        Ok((_, resp, _)) => {
-                            tracing::info!("SISU supplied a title token");
-                            xodus::api::xbox::set_title_token(resp.title_token.token.clone());
-                            true
+                TITLE_TOKEN
+                    .get_or_init(|| async {
+                        match xodus::auth::do_sisu(
+                            &context.client,
+                            context.tokens(),
+                            "0000000040159362",
+                            896928775,
+                        )
+                        .await
+                        {
+                            Ok((_, resp, _)) => {
+                                tracing::info!("SISU supplied a title token");
+                                xodus::api::xbox::set_title_token(resp.title_token.token.clone());
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!("SISU title token unavailable: {e}");
+                                false
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("SISU title token unavailable: {e}");
-                            false
-                        }
-                    }
-                })
-                .await;
+                    })
+                    .await;
             }
             let device_token = context.device_token.as_ref().unwrap().clone();
 
-            let sisu = SISU
-                .get_or_init(|| async {
-                    match xodus::auth::sisu_identity(&context.client, context.tokens()).await {
-                        Ok(id) => {
-                            tracing::info!("SISU issued a device, title and user token set");
-                            Some(id)
+            // A claim for the title that is actually running, or none.
+            //
+            // Never a stand-in: a token claiming some other title is refused by
+            // the very services the claim exists for, so where the title is
+            // unknown the claimless chain below is the better answer.
+            let refused = NO_TITLE_CLAIM
+                .lock()
+                .map(|s| s.contains(&relying_party))
+                .unwrap_or(false);
+            let sisu = match (&title, refused) {
+                (Some((id, client)), false) => {
+                    sisu_for(&context.client, context.tokens(), *id, client).await
+                }
+                _ => None,
+            };
+
+            // Say so when this request is one of the ones that will come back
+            // 403 without a claim. It is the only chance to name the cause:
+            // the title makes the call itself, sees a bare 403, and reports it
+            // as "failed to create party" or a broken sign-in.
+            if sisu.is_none() {
+                if let Some(what) = xodus::api::xbox::claims::needs_title_claim(&req.url) {
+                    let why = match (&title, refused) {
+                        (None, _) => "the runtime sent no TitleId/MSAAppId (is the title's \
+                                      MicrosoftGame.config readable?)"
+                            .to_string(),
+                        (Some(_), true) => {
+                            format!("{relying_party} would not issue a token carrying one")
                         }
-                        Err(e) => {
-                            tracing::warn!("{e}; falling back to a user-only chain");
-                            None
-                        }
-                    }
-                })
-                .await;
+                        (Some((id, _)), false) => format!("SISU could not mint one for title {id}"),
+                    };
+                    tracing::error!("{} will fail: no title claim -- {why}", what);
+                }
+            }
 
             if let Some(id) = sisu.as_ref() {
                 let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8);
@@ -386,7 +485,12 @@ pub async fn parse_message(
                     Ok(xsts) => {
                         let token = xodus::api::xbox::get_xsts_auth_header(xsts.clone());
                         let signature = match signer.as_ref() {
-                            Some(s) => sign_for_with(&req, &token, &endpoints_for(&context.client).await, s),
+                            Some(s) => sign_for_with(
+                                &req,
+                                &token,
+                                &endpoints_for(&context.client).await,
+                                s,
+                            ),
                             None => String::new(),
                         };
                         let payload = XSTSTokenResponse {
@@ -398,7 +502,7 @@ pub async fn parse_message(
                         };
                         if let Ok(mut cache) = XSTS_CACHE.lock() {
                             cache.insert(
-                                relying_party.clone(),
+                                cache_key.clone(),
                                 CachedToken {
                                     token: payload.token.clone(),
                                     xuid: payload.xuid.clone(),
@@ -410,7 +514,16 @@ pub async fn parse_message(
                         return Ok(quick_xml::se::to_string(&payload)?.as_bytes().to_vec());
                     }
                     Err(e) => {
-                        tracing::warn!("SISU-based XSTS failed for {relying_party}: {e}");
+                        // The audience would not take a title claim. Remember
+                        // it so the next request for it skips straight to the
+                        // claimless chain instead of paying for the refusal.
+                        tracing::warn!(
+                            "{relying_party} refused a title claim ({e}); \
+                             falling back to a token without one"
+                        );
+                        if let Ok(mut set) = NO_TITLE_CLAIM.lock() {
+                            set.insert(relying_party.clone());
+                        }
                     }
                 }
             }
@@ -459,7 +572,7 @@ pub async fn parse_message(
             };
             if let Ok(mut cache) = XSTS_CACHE.lock() {
                 cache.insert(
-                    relying_party.clone(),
+                    cache_key,
                     CachedToken {
                         token: payload.token.clone(),
                         xuid: payload.xuid.clone(),
