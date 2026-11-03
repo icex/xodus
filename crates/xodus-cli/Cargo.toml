@@ -29,9 +29,13 @@ tempfile = "3.27.0"
 rustix = "1.1.4"
 ctrlc = "3.5.2"
 nix = "0.31.3"
+flate2 = "1.1.10"
+quick-xml = "0.42.0"
+sha2 = "0.11.0"
 
 [features]
 tokio_console = ["dep:console-subscriber"]
 
 [dev-dependencies]
+msixvc = { path = "../msixvc", features = ["test-signing"] }
 p256 = { version = "0.13", features = ["ecdsa"] }

@@ -9,6 +9,7 @@ mod commands;
 mod license;
 mod package;
 mod webview;
+mod xvd_key;
 
 #[derive(Subcommand)]
 enum SubCommand {
@@ -176,6 +177,16 @@ enum SubCommand {
         #[arg(short, long)]
         market: Option<String>,
     },
+    #[command(
+        name = "xvd-key",
+        about = "Show, fetch or remove the key package header signatures are checked with"
+    )]
+    XvdKey {
+        #[command(subcommand)]
+        action: Option<XvdKeyAction>,
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
         #[command(subcommand)]
@@ -210,6 +221,27 @@ enum PresenceAction {
     },
     #[command(about = "Read the signed-in account's own presence")]
     Get {
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum XvdKeyAction {
+    #[command(about = "Whether the key is stored and usable (the default)")]
+    Status {
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(
+        about = "Fetch Microsoft Gaming Services anonymously from the Store, keep the pinned key from it, delete the rest"
+    )]
+    Fetch {
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
+    },
+    #[command(about = "Remove the stored key")]
+    Forget {
         #[arg(long, default_value_t = false, help = "Emit JSON")]
         json: bool,
     },
@@ -278,6 +310,17 @@ async fn main() -> ExitCode {
         .build()
         .unwrap();
     let args = CliArgs::parse();
+
+    // No account, keychain or device identity: the key is Microsoft's public
+    // key, fetched anonymously, and a launcher asks for its status often.
+    if let SubCommand::XvdKey { action, json } = &args.command {
+        return match action {
+            None => commands::xvd_key::status(*json),
+            Some(XvdKeyAction::Status { json: j }) => commands::xvd_key::status(*json || *j),
+            Some(XvdKeyAction::Fetch { json: j }) => commands::xvd_key::fetch(*json || *j).await,
+            Some(XvdKeyAction::Forget { json: j }) => commands::xvd_key::forget(*json || *j),
+        };
+    }
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let profile_root = match xodus::profiles::root() {
@@ -349,7 +392,8 @@ async fn main() -> ExitCode {
         SubCommand::Login => commands::login::run(&client, &tokens).await,
         SubCommand::AccountProfiles { .. }
         | SubCommand::MigrateAccounts
-        | SubCommand::AddAccount => unreachable!(),
+        | SubCommand::AddAccount
+        | SubCommand::XvdKey { .. } => unreachable!(),
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
             path,

@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use xodus::models::packagespc::PackageFile;
 use xodus::tokens::TokenManager;
 
-use crate::package::{get_content_id, get_packages, package_url};
+use crate::package::{HeaderCheck, get_content_id, get_packages, package_url};
 
 pub async fn run(
     client: &reqwest::Client,
@@ -55,7 +55,11 @@ pub async fn run(
     };
     println!();
     for file in files {
-        let url = match package_url(&file.cdn_root_paths, &file.relative_url, false) {
+        let url = match package_url(
+            &file.cdn_root_paths,
+            &file.relative_url,
+            HeaderCheck::Nothing,
+        ) {
             Ok(url) => url,
             Err(err) => {
                 eprintln!("{err}");

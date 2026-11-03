@@ -1,0 +1,21 @@
+{
+ "Products": [
+  {
+   "ProductId": "9MWPM2CQNLHN",
+   "LocalizedProperties": [
+    {
+     "ProductTitle": "Gaming Services"
+    }
+   ],
+   "DisplaySkuAvailabilities": [
+    {
+     "Sku": {
+      "Properties": {
+       "FulfillmentData": "{\"ProductId\": \"9MWPM2CQNLHN\", \"WuBundleId\": \"00000000-0000-4000-8000-000000000000\", \"WuCategoryId\": \"aaaaaaaa-1111-4222-8333-444444444444\", \"PackageFamilyName\": \"Microsoft.GamingServices_8wekyb3d8bbwe\", \"SkuId\": \"0010\"}"
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

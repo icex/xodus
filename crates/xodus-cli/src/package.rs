@@ -100,14 +100,15 @@ pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
 /// answer https with a certificate for other names, so asking them for the
 /// same path over https fails every time. Over http the pages are still
 /// checked against the package's hash tree. The header that vouches for that
-/// tree is held to the package service's hash when it gives one (`anchored`,
-/// see `header_anchor`); when it does not, nothing vouches for the header, and
-/// a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain http package
-/// either way. A root in any other scheme is refused.
+/// tree is held to the package service's hash when it gives one (see
+/// `header_anchor`) and to its signature when the signing key is here (see
+/// `crate::xvd_key`); `checked` says which. When neither, nothing vouches for
+/// the header, and a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain
+/// http package either way. A root in any other scheme is refused.
 pub fn package_url(
     cdn_roots: &[String],
     relative_url: &str,
-    anchored: bool,
+    checked: HeaderCheck,
 ) -> Result<String, String> {
     let url = package_url_with(
         cdn_roots,
@@ -115,20 +116,51 @@ pub fn package_url(
         std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
     )?;
     if !has_scheme(&url, "https://") {
-        if anchored {
-            eprintln!(
-                "note: the package service lists only plain http for this package; its \
-                 header is held to the hash the package service gives, and its pages to \
-                 the header's hash tree"
-            );
-        } else {
-            eprintln!(
-                "note: the package service lists only plain http for this package; its pages \
-                 are checked against its hash tree, but nothing vouches for its header"
-            );
-        }
+        eprintln!(
+            "note: the package service lists only plain http for this package; {}",
+            checked.note()
+        );
     }
     Ok(url)
+}
+
+/// What a package's header is checked against, besides itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderCheck {
+    Nothing,
+    ServiceHash,
+    Signature,
+    SignatureAndServiceHash,
+}
+
+impl HeaderCheck {
+    pub fn new(signed: bool, anchored: bool) -> Self {
+        match (signed, anchored) {
+            (false, false) => HeaderCheck::Nothing,
+            (false, true) => HeaderCheck::ServiceHash,
+            (true, false) => HeaderCheck::Signature,
+            (true, true) => HeaderCheck::SignatureAndServiceHash,
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            HeaderCheck::Nothing => {
+                "its pages are checked against its hash tree, but nothing vouches for its header"
+            }
+            HeaderCheck::ServiceHash => {
+                "its header is held to the hash the package service gives, and its pages to \
+                 the header's hash tree"
+            }
+            HeaderCheck::Signature => {
+                "its header is held to its signature, and its pages to the header's hash tree"
+            }
+            HeaderCheck::SignatureAndServiceHash => {
+                "its header is held to its signature and to the hash the package service \
+                 gives, and its pages to the header's hash tree"
+            }
+        }
+    }
 }
 
 fn has_scheme(url: &str, scheme: &str) -> bool {

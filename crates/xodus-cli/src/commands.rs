@@ -14,3 +14,4 @@ pub mod run;
 pub mod splicense;
 pub mod streaming;
 pub mod xblcheck;
+pub mod xvd_key;

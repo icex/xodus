@@ -9,8 +9,12 @@ use fs2::available_space;
 use futures_util::{TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use msixvc::layout::PAGE_SIZE;
+use msixvc::signature::XvdSigningKey;
 use msixvc::streaming;
-use msixvc::xvd::{SegmentFile, TopHashMismatch, XvdFile, package_relative_path};
+use msixvc::xvd::{
+    HeaderChecks, HeaderRefused, PackageIdentity, SegmentFile, TopHashMismatch, XvdFile,
+    package_relative_path,
+};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -18,11 +22,44 @@ use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages, header_anchor, package_url, unanchored_note};
+use crate::package::{
+    HeaderCheck, get_content_id, get_packages, header_anchor, package_url, unanchored_note,
+};
 
 struct Job {
     name: String,
     content: SegmentFile,
+}
+
+/// What the package header is held to before anything in it is believed.
+#[derive(Default)]
+struct HeaderTrust {
+    /// The package service's `HashOfHashes`, read as the header's top hash.
+    anchor: Option<[u8; 32]>,
+    /// The key the header's signature must verify with.
+    key: Option<XvdSigningKey>,
+    /// The package the package service named, which a signed header must be.
+    identity: Option<PackageIdentity>,
+}
+
+impl HeaderTrust {
+    fn checks(&self) -> HeaderChecks<'_> {
+        HeaderChecks {
+            top_hash: self.anchor.as_ref(),
+            signed_by: self.key.as_ref(),
+            identity: self.identity.as_ref(),
+        }
+    }
+}
+
+/// The key to check the package header's signature with, fetched once if it
+/// is not stored yet; see `crate::xvd_key::for_install`. `Err` when there is
+/// none and `XODUS_REQUIRE_SIGNED_PACKAGE=1`.
+async fn signing_key(fetch: crate::xvd_key::Fetch) -> Result<Option<XvdSigningKey>, ExitCode> {
+    crate::xvd_key::for_install(fetch).await.map_err(|err| {
+        eprintln!("{err}");
+        ExitCode::FAILURE
+    })
 }
 
 enum ProgressEvent {
@@ -59,6 +96,17 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
+        // A file on disk: its signature is checked if a key is stored (never
+        // fetched for it, so this stays offline), but nothing says which
+        // package it should be.
+        let key = match signing_key(crate::xvd_key::Fetch::Never).await {
+            Ok(key) => key,
+            Err(code) => return code,
+        };
+        let trust = HeaderTrust {
+            key,
+            ..HeaderTrust::default()
+        };
         run_cli_reader(
             client,
             tokens,
@@ -69,22 +117,33 @@ pub async fn run(
             f,
             l,
             &source,
-            None,
+            trust,
             tx,
             rx,
         )
         .await
     } else {
         // The top hash the package service vouches for, when the package came
-        // from it and it gave one. A URL given directly has nothing to go by.
-        let (vurl, anchor) = if source.starts_with("http://") || source.starts_with("https://") {
+        // from it and it gave one, and the package it named. A URL given
+        // directly has nothing to go by but the header's signature.
+        let (vurl, trust) = if source.starts_with("http://") || source.starts_with("https://") {
+            let key = match signing_key(crate::xvd_key::Fetch::Allowed).await {
+                Ok(key) => key,
+                Err(code) => return code,
+            };
             if source.starts_with("http://") {
                 eprintln!(
-                    "warning: {source} is plain http; the package's pages are checked against \
-                     its hash tree, but nothing vouches for its header"
+                    "warning: {source} is plain http; {}",
+                    HeaderCheck::new(key.is_some(), false).note()
                 );
             }
-            (source, None)
+            (
+                source,
+                HeaderTrust {
+                    key,
+                    ..HeaderTrust::default()
+                },
+            )
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
                 let content_id_task = get_content_id(client, source, market.clone()).await;
@@ -137,11 +196,29 @@ pub async fn run(
                     return ExitCode::FAILURE;
                 }
             };
-            if anchor.is_none() {
+            let key = match signing_key(crate::xvd_key::Fetch::Allowed).await {
+                Ok(key) => key,
+                Err(code) => return code,
+            };
+            if anchor.is_none() && key.is_none() {
                 eprintln!("{}", unanchored_note(file));
             }
-            match package_url(&file.cdn_root_paths, &file.relative_url, anchor.is_some()) {
-                Ok(url) => (url, anchor),
+            let checked = HeaderCheck::new(key.is_some(), anchor.is_some());
+            // What a signed header must say it is.
+            let identity = PackageIdentity {
+                content_id: package.content_id.clone(),
+                version_id: package.version_id.clone(),
+                version: package.version.clone(),
+            };
+            match package_url(&file.cdn_root_paths, &file.relative_url, checked) {
+                Ok(url) => (
+                    url,
+                    HeaderTrust {
+                        anchor,
+                        key,
+                        identity: Some(identity),
+                    },
+                ),
                 Err(err) => {
                     eprintln!("{err}");
                     return ExitCode::FAILURE;
@@ -188,7 +265,7 @@ pub async fn run(
             http_file,
             l,
             url,
-            anchor,
+            trust,
             tx,
             rx,
         )
@@ -270,7 +347,7 @@ async fn run_cli_reader<Reader>(
     reader: Reader,
     l: u64,
     url: &str,
-    anchor: Option<[u8; 32]>,
+    trust: HeaderTrust,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
 ) -> Result<(), String>
@@ -336,7 +413,7 @@ where
         reader,
         l,
         url,
-        anchor,
+        &trust,
         &tx,
     )
     .await;
@@ -416,28 +493,37 @@ fn needs_download(
 
 /// Parse a package being downloaded, checked before anything in it is believed.
 ///
-/// With `anchor`, the header's top hash must be the one the package service
-/// gave, and a header that is not is refused before the tree it names is read:
-/// see `XvdFile::parse_anchored`. Without one, the package is checked against
-/// itself only, as `XvdFile::parse_verified` does.
+/// With a key, the header's signature must verify with it before any of the
+/// header is read, a signed header may not turn data integrity off, and with
+/// an identity it must name the package the package service named. With an
+/// anchor, the header's top hash must be the one the package service gave.
+/// A header that fails any of these is refused before the tree it names is
+/// read: see `XvdFile::parse_checked`. With none of them, the package is
+/// checked against itself only, as `XvdFile::parse_verified` does.
 async fn read_header<Reader>(
     remote_file: &mut Reader,
-    anchor: Option<&[u8; 32]>,
+    trust: &HeaderTrust,
 ) -> Result<XvdFile, String>
 where
     Reader: AsyncRead + AsyncSeek + Unpin,
 {
-    let parsed = match anchor {
-        Some(top_hash) => XvdFile::parse_anchored(remote_file, top_hash).await,
-        None => XvdFile::parse_verified(remote_file).await,
-    };
-    parsed.map_err(|err| match err.downcast_ref::<TopHashMismatch>() {
-        Some(mismatch) => format!(
-            "refusing this download: {mismatch}, which the package service gave as its \
-             HashOfHashes. The package was changed on its way here, or the CDN served \
-             another package; nothing from it was installed"
-        ),
-        None => stopped("read the package header")(err),
+    let parsed = XvdFile::parse_checked(remote_file, trust.checks()).await;
+    parsed.map_err(|err| {
+        if let Some(mismatch) = err.downcast_ref::<TopHashMismatch>() {
+            format!(
+                "refusing this download: {mismatch}, which the package service gave as its \
+                 HashOfHashes. The package was changed on its way here, or the CDN served \
+                 another package; nothing from it was installed"
+            )
+        } else if let Some(refused) = err.downcast_ref::<HeaderRefused>() {
+            format!(
+                "refusing this download: {refused}. The header is checked against the key that \
+                 signs retail game packages, so this package was changed on its way here, or \
+                 is not the one the package service named; nothing from it was installed"
+            )
+        } else {
+            stopped("read the package header")(err)
+        }
     })
 }
 
@@ -507,7 +593,7 @@ async fn run_reader<Reader>(
     reader: Reader,
     l: u64,
     url: &str,
-    anchor: Option<[u8; 32]>,
+    trust: &HeaderTrust,
     tx: &Sender<ProgressEvent>,
 ) -> Result<(), String>
 where
@@ -523,7 +609,7 @@ where
     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
         .await
         .map_err(stopped("open the download cache"))?;
-    let remote_xvd = read_header(&mut remote_file, anchor.as_ref()).await?;
+    let remote_xvd = read_header(&mut remote_file, trust).await?;
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let files = remote_xvd
@@ -898,7 +984,11 @@ mod tests {
         let p = msixvc::xvd::testing::package();
         let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
         let read = |bytes: Vec<u8>, anchor: Option<[u8; 32]>| async move {
-            read_header(&mut std::io::Cursor::new(bytes), anchor.as_ref()).await
+            let trust = HeaderTrust {
+                anchor,
+                ..HeaderTrust::default()
+            };
+            read_header(&mut std::io::Cursor::new(bytes), &trust).await
         };
 
         // Match.
@@ -924,6 +1014,82 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.starts_with("refusing this download"), "{err}");
+    }
+
+    /// With the signing key, the header must carry a signature that verifies
+    /// with it and name the package the package service named; anything else
+    /// is refused before the tree is read, and said to be a refusal rather
+    /// than a dropped connection.
+    #[tokio::test]
+    async fn the_header_is_held_to_its_signature_and_the_package_named() {
+        use msixvc::signature::testing::{sign, test_verifying_key};
+
+        let content_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+        let pduid = "11223344-5566-7788-99aa-bbccddeeff00";
+        let mut p = msixvc::xvd::testing::package();
+        let content = uuid::Uuid::parse_str(content_id).unwrap().to_bytes_le();
+        p.bytes[0x220..0x230].copy_from_slice(&content);
+        p.bytes[0x230..0x240].copy_from_slice(&content);
+        p.bytes[0x3AC..0x3BC].copy_from_slice(&uuid::Uuid::parse_str(pduid).unwrap().to_bytes_le());
+        p.bytes[0x3BC..0x3C4].copy_from_slice(&[0, 0, 109, 0, 0xB0, 2, 3, 0]);
+        sign(&mut p.bytes);
+        let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
+        let trust = |version: &str| HeaderTrust {
+            anchor: Some(top),
+            key: Some(test_verifying_key()),
+            identity: Some(PackageIdentity {
+                content_id: content_id.into(),
+                version_id: format!("aaaaaaaa-0000-4000-8000-000000000000.{pduid}"),
+                version: version.into(),
+            }),
+        };
+        let read = |bytes: Vec<u8>, trust: HeaderTrust| async move {
+            read_header(&mut std::io::Cursor::new(bytes), &trust).await
+        };
+
+        assert!(read(p.bytes.clone(), trust("3.688.109.0")).await.is_ok());
+
+        // Signed by the right key, for another version of the package.
+        let err = read(p.bytes.clone(), trust("3.688.110.0"))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.starts_with("refusing this download"), "{err}");
+        assert!(err.contains("package_version"), "{err}");
+
+        // One byte of the signed header changed: the signature fails before
+        // the top hash or the tree are looked at.
+        let mut changed = p.bytes[..PAGE_SIZE].to_vec();
+        changed[0x288] ^= 1;
+        let err = read(changed, trust("3.688.109.0")).await.err().unwrap();
+        assert!(err.starts_with("refusing this download"), "{err}");
+        assert!(err.contains("signature does not verify"), "{err}");
+        assert!(!err.contains("trying again"), "{err}");
+
+        // Not signed at all.
+        let mut unsigned = p.bytes.clone();
+        unsigned[..0x200].fill(0);
+        let err = read(unsigned, trust("3.688.109.0")).await.err().unwrap();
+        assert!(err.contains("not signed"), "{err}");
+
+        // Signed, but with data integrity off.
+        let mut no_integrity = p.bytes.clone();
+        no_integrity[0x208] |= 1 << 2;
+        sign(&mut no_integrity);
+        let err = read(no_integrity, trust("3.688.109.0"))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("DATA_INTEGRITY_DISABLED"), "{err}");
+
+        // Without a key, as before: the same unsigned header is read.
+        let mut unsigned = p.bytes.clone();
+        unsigned[..0x200].fill(0);
+        let without_key = HeaderTrust {
+            anchor: Some(top),
+            ..HeaderTrust::default()
+        };
+        assert!(read(unsigned, without_key).await.is_ok());
     }
 
     /// A package on disk, the parsed package, and a job for pages 5..8 of its

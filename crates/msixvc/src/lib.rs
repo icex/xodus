@@ -2,6 +2,7 @@ pub mod crypt;
 pub mod layout;
 pub mod math;
 pub mod models;
+pub mod signature;
 pub mod streaming;
 pub mod streaming_ntfs;
 pub mod xsp;

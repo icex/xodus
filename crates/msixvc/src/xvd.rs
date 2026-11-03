@@ -30,6 +30,7 @@ use crate::models::xvd::{
     XvdHeader, XvdSegmentMetadataHeader, XvdSegmentMetadataSegment, XvdSegmentMetadataSegmentFlags,
     XvdUserDataHeader, XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
+use crate::signature::{SignatureError, XvdSigningKey, verify_header};
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 
 pub struct SyncSubstream<R> {
@@ -370,6 +371,98 @@ pub struct TopHashMismatch {
 
 fn hex32(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What a package is, as a source the download cannot change says: the
+/// authenticated package service's `ContentId`, `VersionId` and `Version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageIdentity {
+    pub content_id: String,
+    pub version_id: String,
+    pub version: String,
+}
+
+/// What a package's header is held to before anything in it is believed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeaderChecks<'a> {
+    /// The top hash the header must carry: see `XvdFile::parse_anchored`.
+    pub top_hash: Option<&'a [u8; 32]>,
+    /// The key the header's signature must verify with.
+    pub signed_by: Option<&'a XvdSigningKey>,
+    /// The package the header must say it is. Compared only once the
+    /// signature has verified, since an unsigned header can say anything.
+    pub identity: Option<&'a PackageIdentity>,
+}
+
+/// A package header refused by `HeaderChecks::signed_by` or `identity`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HeaderRefused {
+    #[error("{0}")]
+    Signature(#[from] SignatureError),
+    #[error(
+        "the package header is signed but turns its data integrity checks off \
+         (DATA_INTEGRITY_DISABLED), so nothing after it could be checked"
+    )]
+    IntegrityDisabled,
+    #[error(
+        "the package header says its {field} is {header}, but the package service gave {service}"
+    )]
+    Identity {
+        field: &'static str,
+        header: String,
+        service: String,
+    },
+}
+
+/// Hold a signed header to the package the package service named.
+///
+/// The header's `vduid` and `uduid` are the package's `ContentId`, its
+/// `pduid` is the trailing GUID of the `VersionId`, and its `package_version`
+/// is the first four fields of the `Version` (which may go on with a build
+/// id): the relationships seen on retail packages. The header's
+/// `product_id` is not compared; how it is encoded is not known.
+pub fn check_identity(header: &XvdHeader, identity: &PackageIdentity) -> Result<(), HeaderRefused> {
+    let mismatch = |field: &'static str, header: String, service: &str| HeaderRefused::Identity {
+        field,
+        header,
+        service: service.to_string(),
+    };
+    let content_id = Uuid::try_parse(identity.content_id.trim()).ok();
+    for (field, value) in [("vduid", header.vduid), ("uduid", header.uduid)] {
+        if content_id != Some(value) {
+            return Err(mismatch(field, value.to_string(), &identity.content_id));
+        }
+    }
+    let version_id: String = identity
+        .version_id
+        .chars()
+        .filter(|c| !matches!(c, '-' | '{' | '}'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let pduid = header.pduid.simple().to_string();
+    if header.pduid.is_nil() || !version_id.trim_end().ends_with(&pduid) {
+        return Err(mismatch(
+            "pduid",
+            header.pduid.to_string(),
+            &identity.version_id,
+        ));
+    }
+    let service_version: Option<Vec<u16>> = identity
+        .version
+        .trim()
+        .splitn(5, '.')
+        .take(4)
+        .map(|part| part.parse::<u16>().ok())
+        .collect();
+    let v = &header.package_version;
+    if service_version.as_deref() != Some(&[v.major, v.minor, v.patch, v.build][..]) {
+        return Err(mismatch(
+            "package_version",
+            v.to_string(),
+            &identity.version,
+        ));
+    }
+    Ok(())
 }
 
 /// A page whose contents do not hash to what the package's hash tree says.
@@ -716,7 +809,7 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        Self::parse_ex(file, false, None).await
+        Self::parse_ex(file, false, HeaderChecks::default()).await
     }
 
     /// Parse a package and check it against itself before trusting any of it.
@@ -732,7 +825,7 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        Self::parse_ex(file, true, None).await
+        Self::parse_ex(file, true, HeaderChecks::default()).await
     }
 
     /// Parse a package as `parse_verified` does, with its header held to a
@@ -751,13 +844,39 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        Self::parse_ex(file, true, Some(top_hash)).await
+        Self::parse_checked(
+            file,
+            HeaderChecks {
+                top_hash: Some(top_hash),
+                ..HeaderChecks::default()
+            },
+        )
+        .await
+    }
+
+    /// Parse a package as `parse_verified` does, with its header first held
+    /// to `checks`.
+    ///
+    /// With `signed_by`, the header's signature is verified over the raw bytes
+    /// before any of them is parsed; a header that is unsigned, or whose
+    /// signature does not verify, is refused with `HeaderRefused::Signature`.
+    /// A signed header that turns data integrity off is refused too, and with
+    /// `identity` the header must name that package. Then the top hash, if
+    /// one is given, and then the hash tree, as `parse_anchored` does.
+    pub async fn parse_checked<Reader>(
+        file: Reader,
+        checks: HeaderChecks<'_>,
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        Reader: AsyncRead + AsyncSeek + Unpin,
+    {
+        Self::parse_ex(file, true, checks).await
     }
 
     async fn parse_ex<Reader>(
         mut file: Reader,
         verify: bool,
-        top_hash: Option<&[u8; 32]>,
+        checks: HeaderChecks<'_>,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
@@ -765,9 +884,20 @@ impl XvdFile {
         let xvd_header = {
             let mut buf = XvdHeader::buffer();
             file.read_exact(&mut buf).await?;
+            if let Some(key) = checks.signed_by {
+                verify_header(&buf, key).map_err(HeaderRefused::from)?;
+            }
             XvdHeader::try_from_array(&buf)?
         };
-        if let Some(expected) = top_hash
+        if checks.signed_by.is_some() {
+            if !xvd_header.volume_flags.is_data_integrity_enabled() {
+                return Err(Box::new(HeaderRefused::IntegrityDisabled));
+            }
+            if let Some(identity) = checks.identity {
+                check_identity(&xvd_header, identity)?;
+            }
+        }
+        if let Some(expected) = checks.top_hash
             && xvd_header.top_hash_block_hash != *expected
         {
             return Err(Box::new(TopHashMismatch {
@@ -1756,6 +1886,201 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
+    }
+
+    mod signed {
+        use std::io::Cursor;
+
+        use uuid::Uuid;
+
+        use super::super::testing::{Package, package};
+        use super::super::{HeaderChecks, HeaderRefused, PackageIdentity, XvdFile};
+        use crate::layout::PAGE_SIZE;
+        use crate::signature::SignatureError;
+        use crate::signature::testing::{other_verifying_key, sign, test_verifying_key};
+
+        const CONTENT_ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+        const PDUID: &str = "11223344-5566-7788-99aa-bbccddeeff00";
+
+        /// The fixture package naming a content id, a pduid and a version, signed
+        /// with the test key.
+        fn signed_package() -> Package {
+            let mut p = package();
+            let content = Uuid::parse_str(CONTENT_ID).unwrap().to_bytes_le();
+            p.bytes[0x220..0x230].copy_from_slice(&content);
+            p.bytes[0x230..0x240].copy_from_slice(&content);
+            p.bytes[0x3AC..0x3BC].copy_from_slice(&Uuid::parse_str(PDUID).unwrap().to_bytes_le());
+            // 1.2.3.4, stored build first.
+            for (i, part) in [4u16, 3, 2, 1].iter().enumerate() {
+                p.bytes[0x3BC + 2 * i..0x3BE + 2 * i].copy_from_slice(&part.to_le_bytes());
+            }
+            sign(&mut p.bytes);
+            p
+        }
+
+        fn identity() -> PackageIdentity {
+            PackageIdentity {
+                content_id: CONTENT_ID.to_uppercase(),
+                version_id: format!("8c4c1f9a-0000-4000-8000-000000000001-{PDUID}"),
+                version: "1.2.3.4".into(),
+            }
+        }
+
+        async fn parse(
+            bytes: Vec<u8>,
+            identity: Option<&PackageIdentity>,
+            top_hash: Option<&[u8; 32]>,
+        ) -> Result<XvdFile, Box<dyn std::error::Error>> {
+            let key = test_verifying_key();
+            XvdFile::parse_checked(
+                Cursor::new(bytes),
+                HeaderChecks {
+                    top_hash,
+                    signed_by: Some(&key),
+                    identity,
+                },
+            )
+            .await
+        }
+
+        fn refused(err: &(dyn std::error::Error + 'static)) -> HeaderRefused {
+            err.downcast_ref::<HeaderRefused>()
+                .unwrap_or_else(|| panic!("not a refused header: {err}"))
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn a_signed_package_naming_the_package_is_read_and_verified() {
+            let p = signed_package();
+            let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
+            let xvd = parse(p.bytes.clone(), Some(&identity()), Some(&top))
+                .await
+                .unwrap();
+            assert!(xvd.verified);
+            assert_eq!(xvd.header.vduid, Uuid::parse_str(CONTENT_ID).unwrap());
+            // Without an identity to hold it to, the signature alone.
+            assert!(parse(p.bytes.clone(), None, None).await.is_ok());
+            // The version id may be just the pduid, in any case and spelling.
+            let mut bare = identity();
+            bare.version_id = PDUID.to_uppercase().replace('-', "");
+            assert!(parse(p.bytes.clone(), Some(&bare), None).await.is_ok());
+            // A version that goes on with a build id.
+            let mut build = identity();
+            build.version = "1.2.3.4.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
+            assert!(parse(p.bytes, Some(&build), None).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_changed_signed_byte_is_refused_before_anything_else_is_read() {
+            for offset in [0x200, 0x208, 0x218, 0x240, 0x288, 0xFFF] {
+                let mut bytes = signed_package().bytes;
+                bytes[offset] ^= 0x01;
+                // Only the first page: nothing after it is needed to refuse it.
+                bytes.truncate(PAGE_SIZE);
+                let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
+                assert!(
+                    matches!(
+                        refused(&*err),
+                        HeaderRefused::Signature(SignatureError::Invalid(_))
+                    ),
+                    "offset {offset:#x}: {err}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_rest_of_the_header_is_not_signed_but_the_tree_still_holds() {
+            // 0x1000..0x3000 is outside the signature. The fixture's hash tree
+            // does not cover it either, so a change there still parses: what
+            // the client takes from the header is all in the signed page.
+            for offset in [0x1000, 0x1800, 0x2FFF] {
+                let mut bytes = signed_package().bytes;
+                bytes[offset] ^= 0x01;
+                assert!(
+                    parse(bytes, Some(&identity()), None).await.is_ok(),
+                    "{offset:#x}"
+                );
+            }
+            // A page the tree covers is still checked against it.
+            let p = signed_package();
+            let mut bytes = p.bytes.clone();
+            bytes[p.user_data_page * PAGE_SIZE + 100] ^= 0x01;
+            assert!(parse(bytes, Some(&identity()), None).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_or_foreign_header_is_refused() {
+            let mut bytes = signed_package().bytes;
+            bytes[..0x200].fill(0);
+            let err = parse(bytes, None, None).await.err().unwrap();
+            assert_eq!(
+                refused(&*err),
+                HeaderRefused::Signature(SignatureError::Unsigned)
+            );
+            assert!(err.to_string().contains("not signed"), "{err}");
+
+            let other = other_verifying_key();
+            let err = XvdFile::parse_checked(
+                Cursor::new(signed_package().bytes),
+                HeaderChecks {
+                    signed_by: Some(&other),
+                    ..HeaderChecks::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(matches!(
+                refused(&*err),
+                HeaderRefused::Signature(SignatureError::Invalid(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_signed_header_without_data_integrity_is_refused() {
+            let mut bytes = signed_package().bytes;
+            bytes[0x208] |= 1 << 2;
+            sign(&mut bytes);
+            let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
+            assert_eq!(refused(&*err), HeaderRefused::IntegrityDisabled);
+        }
+
+        #[tokio::test]
+        async fn a_signed_header_for_another_package_is_refused() {
+            let bytes = signed_package().bytes;
+            type Change = fn(&mut PackageIdentity);
+            let cases: [(&str, Change); 7] = [
+                ("vduid", |i| {
+                    i.content_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1".into()
+                }),
+                ("vduid", |i| i.content_id = "not a guid".into()),
+                ("pduid", |i| {
+                    i.version_id = "11223344-5566-7788-99aa-bbccddeeff01".into()
+                }),
+                ("pduid", |i| i.version_id = format!("{PDUID}-0")),
+                ("package_version", |i| i.version = "1.2.3.5".into()),
+                ("package_version", |i| i.version = "1.2.3".into()),
+                ("package_version", |i| i.version = "".into()),
+            ];
+            for (field, change) in cases {
+                let mut id = identity();
+                change(&mut id);
+                let err = parse(bytes.clone(), Some(&id), None).await.err().unwrap();
+                match refused(&*err) {
+                    HeaderRefused::Identity { field: f, .. } => assert_eq!(f, field, "{err}"),
+                    other => panic!("{field}: {other}"),
+                }
+            }
+            // uduid alone differing from the content id.
+            let mut bytes = signed_package().bytes;
+            bytes[0x230] ^= 1;
+            sign(&mut bytes);
+            let err = parse(bytes, Some(&identity()), None).await.err().unwrap();
+            assert!(matches!(
+                refused(&*err),
+                HeaderRefused::Identity { field: "uduid", .. }
+            ));
+        }
     }
 
     #[tokio::test]
