@@ -6,18 +6,19 @@ use std::time::{Duration, Instant};
 use std::vec;
 
 use fs2::available_space;
-use futures_util::{StreamExt, stream};
+use futures_util::{TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use msixvc::layout::PAGE_SIZE;
 use msixvc::streaming;
-use msixvc::xvd::{SegmentFile, XvdFile};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncRead;
+use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages};
+use crate::package::{get_content_id, get_packages, package_url};
 
 struct Job {
     name: String,
@@ -42,7 +43,7 @@ pub async fn run(
     market: Option<String>,
 ) -> ExitCode {
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
-    if source.starts_with("file://") {
+    let result = if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = match File::open(fsrc).await {
             Ok(f) => f,
@@ -68,12 +69,18 @@ pub async fn run(
             f,
             l,
             &source,
-            &tx,
+            tx,
             rx,
         )
-        .await;
+        .await
     } else {
         let vurl = if source.starts_with("http://") || source.starts_with("https://") {
+            if source.starts_with("http://") {
+                eprintln!(
+                    "warning: {source} is plain http; the package's pages are checked against \
+                     its hash tree, but nothing vouches for its header"
+                );
+            }
             source
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
@@ -120,22 +127,27 @@ pub async fn run(
                 }
                 return ExitCode::FAILURE;
             };
-            format!(
-                "{}{}",
-                file.cdn_root_paths.first().unwrap(),
-                file.relative_url
-            )
+            match package_url(&file.cdn_root_paths, &file.relative_url) {
+                Ok(url) => url,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
         };
         let url = &vurl;
+        // Its own sender, owned by the reader, so that the channel closes when
+        // the download is over and the progress task can finish.
+        let progress_tx = tx.clone();
         let mut pos = 0;
-        let http_file = streaming::HttpRead::open(
+        let http_file = match streaming::HttpRead::open(
             client.clone(),
             url,
-            Some(|c, _| {
-                if tx
+            Some(move |c: u64, _| {
+                if progress_tx
                     .try_send(ProgressEvent::Advanced {
                         id: usize::MAX,
-                        delta: c - pos,
+                        delta: c.saturating_sub(pos),
                     })
                     .is_ok()
                 {
@@ -144,7 +156,13 @@ pub async fn run(
             }),
         )
         .await
-        .expect("ok");
+        {
+            Ok(http_file) => http_file,
+            Err(err) => {
+                eprintln!("could not start the download from {url}: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
         let l = http_file.len();
 
         run_cli_reader(
@@ -157,13 +175,23 @@ pub async fn run(
             http_file,
             l,
             url,
-            &tx,
+            tx,
             rx,
         )
-        .await;
-    }
+        .await
+    };
 
-    ExitCode::SUCCESS
+    // Every way this can fail ends here, and none of them is a success. A
+    // licence refused, a full disk or a file that would not extract all used
+    // to return early from a function with nothing to return, and the process
+    // exited 0 -- so an update that never happened was reported as finished.
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Download progress another program can read.
@@ -228,13 +256,13 @@ async fn run_cli_reader<Reader>(
     reader: Reader,
     l: u64,
     url: &str,
-    tx: &Sender<ProgressEvent>,
+    tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
-) -> ()
+) -> Result<(), String>
 where
     Reader: AsyncRead + Unpin,
 {
-    tokio::spawn(async move {
+    let progress = tokio::spawn(async move {
         let multi_progress = MultiProgress::new();
         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(
             ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
@@ -283,7 +311,7 @@ where
         json.emit(&total_progess, true);
         total_progess.abandon();
     });
-    run_reader(
+    let result = run_reader(
         client,
         tokens,
         destination,
@@ -293,30 +321,137 @@ where
         reader,
         l,
         url,
-        tx,
+        &tx,
     )
-    .await
+    .await;
+    // The task above ends when the last sender goes, and the forced final line
+    // is the last thing it does. Without waiting for it here, `main` returned
+    // and the runtime dropped the task first as often as not.
+    drop(tx);
+    let _ = progress.await;
+    result
 }
 
-/// Report a streaming failure and stop, instead of panicking.
+/// Describe a streaming failure, instead of panicking.
 ///
 /// These parses read the package header through a cache that the HTTP response
 /// fills. When the response ends early the cache is shorter than it recorded --
 /// `cache ended before cached_len` -- and every read past that point fails. That
 /// is an interrupted download, and it reached the user as a Rust panic and a
 /// backtrace, which says nothing about what happened or what to do next.
-fn or_stop<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> T {
-    match result {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!("failed to {what}: {err}");
-            eprintln!(
-                "the download did not finish -- this is usually the connection dropping \
-                 partway through, so trying again is the first thing to do"
-            );
-            std::process::exit(1);
+fn stopped<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
+    move |err| {
+        format!(
+            "failed to {what}: {err}\n\
+             the download did not finish -- this is usually the connection dropping \
+             partway through, so trying again is the first thing to do"
+        )
+    }
+}
+
+/// The progress label for a file: its last characters, if it is long.
+///
+/// Counted in characters, not bytes. Slicing at a byte offset panicked on a
+/// name with anything but ASCII near its end -- deterministically, so a title
+/// with such a file could never be installed.
+fn shown_name(path: &str) -> String {
+    const WIDTH: usize = 30;
+    if path.chars().count() <= WIDTH {
+        return path.to_owned();
+    }
+    let tail: Vec<char> = path.chars().rev().take(WIDTH - 3).collect();
+    format!("...{}", tail.into_iter().rev().collect::<String>())
+}
+
+/// How long a file is on disk once it is fully written: what it holds, or
+/// whole pages for one kept encrypted, which is written a page at a time.
+fn written_len(file: &SegmentFile) -> u64 {
+    if file.keep_encrypted {
+        file.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64
+    } else {
+        file.length
+    }
+}
+
+/// Whether a file has to be fetched, given what the last install recorded.
+///
+/// The record is the container the last install committed, and it says what
+/// the package held, not what reached the disk. A file the record says is
+/// current is therefore also checked for being there at its full length, so
+/// one that was truncated or lost -- by a crash, a full disk, a hand -- is
+/// fetched again instead of being skipped for ever.
+fn needs_download(
+    out: &Path,
+    name: &str,
+    remote: &SegmentFile,
+    local: Option<&SegmentFile>,
+) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    if remote.data_hashs.is_empty() || remote.data_hashs != local.data_hashs {
+        return true;
+    }
+    let Ok(relative) = package_relative_path(name) else {
+        return true;
+    };
+    std::fs::metadata(out.join(relative)).map_or(true, |m| m.len() != written_len(remote))
+}
+
+/// Read the container the last install committed, for what it says is there.
+async fn read_installed(final_path: &Path) -> Result<HashMap<String, SegmentFile>, String> {
+    let mut file = File::open(final_path).await.map_err(|e| e.to_string())?;
+    let xvd = XvdFile::parse(&mut file).await.map_err(|e| e.to_string())?;
+    let mut lfiles = HashMap::new();
+    let files = xvd
+        .parse_user_package_files(&mut file)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (k, v) in &files {
+        if k == "SegmentMetadata.bin" {
+            lfiles = xvd
+                .parse_segment_metadata(&mut file, v)
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
+
+    if let Ok(sfiles) = xvd
+        .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
+        .await
+    {
+        lfiles.extend(sfiles);
+    }
+    Ok(lfiles)
+}
+
+/// Make the new container the record of what is installed, durably.
+///
+/// The files go to disk first and the record after them, and the record
+/// replaces the old one in a single rename. Before, the old record was deleted,
+/// the new one renamed into its place and nothing synced at all: a power cut
+/// soon after could leave an empty or partial record, which every later update
+/// then failed to parse, or game files that never reached the disk under a
+/// record saying they had.
+fn commit(out: &Path, cache_path: &Path, final_path: &Path) -> Result<(), String> {
+    let dir =
+        std::fs::File::open(out).map_err(|e| format!("could not open {}: {e}", out.display()))?;
+    #[cfg(target_os = "linux")]
+    rustix::fs::syncfs(&dir)
+        .map_err(|e| format!("could not flush {} to disk: {e}", out.display()))?;
+    #[cfg(not(target_os = "linux"))]
+    std::fs::File::open(cache_path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("could not flush {} to disk: {e}", cache_path.display()))?;
+    std::fs::rename(cache_path, final_path).map_err(|e| {
+        format!(
+            "could not record the install ({} -> {}): {e}",
+            cache_path.display(),
+            final_path.display()
+        )
+    })?;
+    dir.sync_all()
+        .map_err(|e| format!("could not flush {} to disk: {e}", out.display()))
 }
 
 async fn run_reader<Reader>(
@@ -330,38 +465,37 @@ async fn run_reader<Reader>(
     l: u64,
     url: &str,
     tx: &Sender<ProgressEvent>,
-) -> ()
+) -> Result<(), String>
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
 
-    std::fs::create_dir_all(out).expect("ok");
+    std::fs::create_dir_all(out).map_err(|e| format!("could not create {}: {e}", out.display()))?;
 
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = or_stop(
-        "open the download cache",
-        streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await,
-    );
-    let remote_xvd = or_stop(
-        "read the package header",
-        XvdFile::parse(&mut remote_file).await,
-    );
+    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+        .await
+        .map_err(stopped("open the download cache"))?;
+    // Checked against itself before anything in it is believed: see
+    // `XvdFile::parse_verified`.
+    let remote_xvd = XvdFile::parse_verified(&mut remote_file)
+        .await
+        .map_err(stopped("read the package header"))?;
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
-    let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
-    let files = or_stop(
-        "read the package file table",
-        remote_xvd.parse_user_package_files(&mut remote_file).await,
-    );
+    let files = remote_xvd
+        .parse_user_package_files(&mut remote_file)
+        .await
+        .map_err(stopped("read the package file table"))?;
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            rfiles = or_stop(
-                "read the package segment metadata",
-                remote_xvd.parse_segment_metadata(&mut remote_file, v).await,
-            );
+            rfiles = remote_xvd
+                .parse_segment_metadata(&mut remote_file, v)
+                .await
+                .map_err(stopped("read the package segment metadata"))?;
         }
     }
 
@@ -371,37 +505,36 @@ where
         })
         .await
         .ok();
-        let sfiles = or_stop(
-            "read the package filesystem",
-            remote_xvd
-                .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-                .await,
-        );
+        let sfiles = remote_xvd
+            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
+            .await
+            .map_err(stopped("read the package filesystem"))?;
         rfiles.extend(sfiles);
     }
+    // The cache has everything it is going to get; the rest comes from the
+    // files' own ranges.
+    drop(remote_file);
 
-    let file = OpenOptions::new()
-        .read(true)
-        .open(final_path.to_owned())
-        .await
-        .ok();
+    // Every name the package gives is checked before anything is fetched, so a
+    // package that names a file outside the destination is refused whole, not
+    // after it has written the files that came before.
+    for name in rfiles.keys() {
+        package_relative_path(name)
+            .map_err(|e| format!("refusing to install this package: {e}"))?;
+    }
 
-    if let Some(mut file) = file {
-        let xvd = XvdFile::parse(&mut file).await.expect("no err");
-
-        let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
-        for (k, v) in &files {
-            if k == "SegmentMetadata.bin" {
-                let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
-                lfiles = sfiles;
-            }
-        }
-
-        if let Ok(sfiles) = xvd
-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
-            .await
-        {
-            lfiles.extend(sfiles);
+    let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
+    if final_path.exists() {
+        // Only a record of what is there; if it cannot be read, everything is
+        // fetched again, which is slow but right. It used to be a panic on
+        // every later run.
+        match read_installed(&final_path).await {
+            Ok(files) => lfiles = files,
+            Err(err) => eprintln!(
+                "the record of the last install ({}) could not be read ({err}); \
+                 every file will be downloaded again",
+                final_path.display()
+            ),
         }
     }
 
@@ -412,58 +545,53 @@ where
         market.unwrap_or("neutral".to_string()),
     )
     .await;
-    if let Err(err) = license {
-        eprintln!("{}", err);
-        return;
-    }
-    let (key, game_splicense) = license.unwrap();
+    let (key, game_splicense) = license.map_err(|err| err.to_string())?;
     if game_splicense.content_keys.len() != 1 {
-        eprintln!(
+        return Err(format!(
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
-        );
-        return;
+        ));
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return;
+        return Err("the licence holds no content key".into());
     };
 
-    let full_key = content_key.unpack(&key).expect("failed to unpack");
+    let full_key = content_key
+        .unpack(&key)
+        .map_err(|e| format!("could not unpack the content key: {e}"))?;
 
-    let total_size = rfiles
+    let jobs: Vec<Job> = rfiles
         .iter()
-        .filter(|(k, v1)| {
-            if let Some(v2) = lfiles.get(*k) {
-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-            } else {
-                true
-            }
+        .filter(|(k, v1)| needs_download(out, k, v1, lfiles.get(*k)))
+        .map(|(n, v)| Job {
+            name: n.clone(),
+            content: SegmentFile {
+                offset: v.offset,
+                length: v.length,
+                data_hashs: vec![],
+                keep_encrypted: v.keep_encrypted,
+            },
         })
-        .map(|(_, v)| v.length)
-        .sum();
+        .collect();
+    let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
 
     let required_free_space = total_size;
-    let available_free_space = match available_space(out) {
-        Ok(space) => space,
-        Err(err) => {
-            eprintln!(
-                "failed to determine available space for {}: {}",
-                out.display(),
-                err
-            );
-            return;
-        }
-    };
+    let available_free_space = available_space(out).map_err(|err| {
+        format!(
+            "failed to determine available space for {}: {}",
+            out.display(),
+            err
+        )
+    })?;
 
     if available_free_space < required_free_space {
-        eprintln!(
+        return Err(format!(
             "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
             out.display(),
             required_free_space,
             available_free_space,
             total_size
-        );
-        return;
+        ));
     }
 
     tx.send(ProgressEvent::UpdateRemaining {
@@ -473,101 +601,452 @@ where
     .await
     .ok();
 
-    let remote_xvd_ref = &remote_xvd;
-    stream::iter(
-        rfiles
-            .iter()
-            .filter(|(k, v1)| {
-                if let Some(v2) = lfiles.get(*k) {
-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-                } else {
-                    true
-                }
-            })
-            .map(|(n, v)| Job {
-                name: n.clone(),
-                content: SegmentFile {
-                    offset: v.offset,
-                    length: v.length,
-                    data_hashs: vec![],
-                    keep_encrypted: v.keep_encrypted,
-                },
-            })
-            .enumerate(),
-    )
-    .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
-        let tx = tx.clone();
-        let client = client.clone();
-        async move {
-            let target_file = out.join(job.name.replace("\\", "/"));
-            if let Some(folder) = target_file.parent() {
-                std::fs::create_dir_all(folder).expect("ok");
-            }
-            let mut fout = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(target_file)
-                .await
-                .expect("ok");
-            let mut lp = 0;
+    // Stops at the first file that fails, and that failure is the result. The
+    // cache is not committed unless every file arrived, so the next run still
+    // sees the old record and fetches whatever this one did not finish.
+    fetch_files(client, &remote_xvd, jobs, out, url, *full_key, parallel, tx).await?;
 
-            let progress = |pos, _| {
-                if tx
-                    .try_send(ProgressEvent::Advanced {
-                        id,
-                        delta: pos - lp,
-                    })
-                    .is_ok()
-                {
-                    lp = pos;
-                }
-            };
-            let path = job.name.to_owned();
-            let shown = if path.len() > 30 {
-                format!("...{}", &path[path.len() - 27..])
-            } else {
-                path.clone()
-            };
-            tx.send(ProgressEvent::Started {
-                id,
-                name: shown,
-                total: job.content.length,
-            })
-            .await
-            .ok();
+    commit(out, &cache_path, &final_path)
+}
 
-            if let Some(fpath) = url.strip_prefix("file://") {
-                let mut i = File::open(&fpath).await.unwrap();
-                // A local container is often a *prefix* of the package -- the
-                // streaming install keeps only what it read. Extracting from one
-                // therefore runs off the end partway through, and `early eof`
-                // arriving as a panic reads as a bug in the extractor rather
-                // than as "this container does not go that far".
-                if let Err(err) = remote_xvd_ref
-                    .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
-                    .await
-                {
-                    eprintln!(
-                        "{}: {err}\n  {fpath} does not contain this file. A container left by a \
-                         streaming install holds only the part of the package that was read; \
-                         extracting the whole title needs the package, not the cache.",
-                        job.name
-                    );
-                    return;
-                }
-                tx.send(ProgressEvent::Finished { id }).await.ok();
-            } else {
-                remote_xvd_ref
-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
-                    .await
-                    .expect("msg");
-                tx.send(ProgressEvent::Finished { id }).await.ok();
-            }
+/// A file being written under a temporary name beside the one it is for, and
+/// removed when dropped unless it was put in place. The first file that fails
+/// drops every other job mid-write; writing over the real name would leave
+/// those files half written -- for an update, the good copies they were
+/// replacing truncated -- until a later run noticed.
+struct PartFile {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl PartFile {
+    /// Create (or empty) the temporary file for `target`. Opened here rather
+    /// than through tokio, so that once this returns the guard owns the file:
+    /// an open still running on a blocking thread when the job is dropped
+    /// would create it after the guard had removed it.
+    fn create(target: &Path, id: usize) -> Result<(Self, File), String> {
+        let path = target.with_file_name(format!(".xodus-part-{id}"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        Ok((Self { path, armed: true }, File::from_std(file)))
+    }
+
+    /// Rename the finished file over `target`.
+    fn put_in_place(mut self, target: &Path) -> Result<(), String> {
+        std::fs::rename(&self.path, target)
+            .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
         }
-    })
-    .await;
+    }
+}
 
-    std::fs::remove_file(&final_path).ok();
-    std::fs::rename(&cache_path, &final_path).expect("ok");
+/// Fetch every file in `jobs` into `out`, `parallel` at a time, from `url`
+/// (a package over http(s), or a container on disk as `file://`).
+///
+/// The first file that fails stops the rest and is the result. Each file is
+/// written under a temporary name and renamed into place only once all of it
+/// is written, so neither the file that failed nor one stopped because of it
+/// is left half written, and a file being replaced keeps its old contents.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_files(
+    client: &reqwest::Client,
+    xvd: &XvdFile,
+    jobs: Vec<Job>,
+    out: &Path,
+    url: &str,
+    full_key: [u8; 32],
+    parallel: Option<usize>,
+    tx: &Sender<ProgressEvent>,
+) -> Result<(), String> {
+    stream::iter(jobs.into_iter().enumerate().map(Ok::<_, String>))
+        .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+            let tx = tx.clone();
+            let client = client.clone();
+            async move {
+                let relative = package_relative_path(&job.name)
+                    .map_err(|e| format!("refusing to install this package: {e}"))?;
+                let target_file = out.join(relative);
+                if let Some(folder) = target_file.parent() {
+                    std::fs::create_dir_all(folder)
+                        .map_err(|e| format!("could not create {}: {e}", folder.display()))?;
+                }
+                let (part, mut fout) = PartFile::create(&target_file, id)?;
+                let mut lp = 0;
+
+                let progress = |pos: u64, _| {
+                    if tx
+                        .try_send(ProgressEvent::Advanced {
+                            id,
+                            delta: pos.saturating_sub(lp),
+                        })
+                        .is_ok()
+                    {
+                        lp = pos;
+                    }
+                };
+                tx.send(ProgressEvent::Started {
+                    id,
+                    name: shown_name(&job.name),
+                    total: job.content.length,
+                })
+                .await
+                .ok();
+
+                let result = if let Some(fpath) = url.strip_prefix("file://") {
+                    match File::open(&fpath).await {
+                        Err(err) => Err(format!("could not open {fpath}: {err}")),
+                        // A local container is often a *prefix* of the
+                        // package -- the streaming install keeps only what it
+                        // read. Extracting from one therefore runs off the end
+                        // partway through, and `early eof` arriving as a panic
+                        // reads as a bug in the extractor rather than as "this
+                        // container does not go that far".
+                        Ok(mut i) => xvd
+                            .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
+                            .await
+                            .map_err(|err| {
+                                format!(
+                                    "{}: {err}\n  {fpath} does not contain this file. A container \
+                                     left by a streaming install holds only the part of the \
+                                     package that was read; extracting the whole title needs \
+                                     the package, not the cache.",
+                                    job.name
+                                )
+                            }),
+                    }
+                } else {
+                    xvd.download_file_http(
+                        &client,
+                        url,
+                        &mut fout,
+                        &job.content,
+                        full_key,
+                        progress,
+                    )
+                    .await
+                    .map_err(|err| format!("{}: {err}", job.name))
+                };
+                // tokio hands writes to another thread; an error from the last
+                // of them (a full disk, say) only shows up here.
+                let result = match result {
+                    Ok(()) => fout
+                        .flush()
+                        .await
+                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
+                    Err(err) => Err(err),
+                };
+                #[cfg(not(target_os = "linux"))]
+                let result = match result {
+                    Ok(()) => fout
+                        .sync_all()
+                        .await
+                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
+                    Err(err) => Err(err),
+                };
+                // Half a file is not left looking like a file: `part` removes
+                // it on an error, and when this job is dropped because
+                // another one failed.
+                result?;
+                drop(fout);
+                part.put_in_place(&target_file)?;
+                tx.send(ProgressEvent::Finished { id }).await.ok();
+                Ok(())
+            }
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(length: u64, hashes: &[u8], keep_encrypted: bool) -> SegmentFile {
+        SegmentFile {
+            offset: 0,
+            length,
+            data_hashs: hashes.iter().map(|&b| [b; 20]).collect(),
+            keep_encrypted,
+        }
+    }
+
+    #[test]
+    fn long_names_are_shortened_on_a_character_boundary() {
+        assert_eq!(shown_name("Content/short.pak"), "Content/short.pak");
+        // Each of these characters is three bytes, so byte `len - 27` falls
+        // inside one: the old slice panicked here.
+        let name = "Content/ローカライズ/テキストテキストテキストテキスト.pak";
+        let shown = shown_name(name);
+        assert!(shown.starts_with("..."));
+        assert_eq!(shown.chars().count(), 30);
+        assert!(name.ends_with(&shown[3..]));
+    }
+
+    #[test]
+    fn a_file_the_record_lists_is_still_fetched_if_it_is_not_all_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+        std::fs::create_dir_all(out.join("Content")).unwrap();
+        let name = r"Content\data.pak";
+        let remote = file(5000, &[1, 2], false);
+        let same = file(5000, &[1, 2], false);
+
+        // Not on disk at all.
+        assert!(needs_download(out, name, &remote, Some(&same)));
+        // Cut short, as a crash before the data reached the disk leaves it.
+        std::fs::write(out.join("Content/data.pak"), vec![0u8; 100]).unwrap();
+        assert!(needs_download(out, name, &remote, Some(&same)));
+        // Whole, and unchanged in the package: skipped.
+        std::fs::write(out.join("Content/data.pak"), vec![0u8; 5000]).unwrap();
+        assert!(!needs_download(out, name, &remote, Some(&same)));
+        // Changed in the package, or not in the record: fetched.
+        assert!(needs_download(
+            out,
+            name,
+            &remote,
+            Some(&file(5000, &[1, 3], false))
+        ));
+        assert!(needs_download(out, name, &remote, None));
+
+        // A file kept encrypted is written in whole pages.
+        let exe = file(5000, &[4, 5], true);
+        std::fs::write(out.join("Game.exe"), vec![0u8; 5000]).unwrap();
+        assert!(needs_download(
+            out,
+            "Game.exe",
+            &exe,
+            Some(&file(5000, &[4, 5], true))
+        ));
+        std::fs::write(out.join("Game.exe"), vec![0u8; 8192]).unwrap();
+        assert!(!needs_download(
+            out,
+            "Game.exe",
+            &exe,
+            Some(&file(5000, &[4, 5], true))
+        ));
+    }
+
+    #[test]
+    fn the_commit_replaces_the_record_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+        let cache = out.join(".xodus-streaming-tmp.msixvc");
+        let record = out.join(".xodus-streaming.msixvc");
+        std::fs::write(&record, b"old").unwrap();
+        std::fs::write(&cache, b"new").unwrap();
+        commit(out, &cache, &record).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), b"new");
+        assert!(!cache.exists());
+    }
+
+    /// A package on disk, the parsed package, and a job for pages 5..8 of its
+    /// drive plus a little of page 8.
+    async fn fixture(dir: &Path) -> (std::path::PathBuf, XvdFile, Job, Vec<u8>) {
+        let p = msixvc::xvd::testing::package();
+        let path = dir.join("package.msixvc");
+        std::fs::write(&path, &p.bytes).unwrap();
+        let xvd = XvdFile::parse_verified(std::io::Cursor::new(p.bytes.clone()))
+            .await
+            .unwrap();
+        let first = (p.drive_page + 5) * PAGE_SIZE;
+        let length = 3 * PAGE_SIZE + 100;
+        let job = Job {
+            name: r"Content\data.pak".into(),
+            content: SegmentFile {
+                offset: first as u64,
+                length: length as u64,
+                data_hashs: vec![],
+                keep_encrypted: false,
+            },
+        };
+        (path, xvd, job, p.bytes[first..first + length].to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_are_extracted_from_a_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, xvd, job, expected) = fixture(dir.path()).await;
+        let out = dir.path().join("game");
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let url = format!("file://{}", path.display());
+
+        fetch_files(
+            &reqwest::Client::new(),
+            &xvd,
+            vec![job],
+            &out,
+            &url,
+            [0; 32],
+            None,
+            &tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(out.join("Content/data.pak")).unwrap(),
+            expected
+        );
+    }
+
+    /// Extracting from a container that stops short: the file that runs off
+    /// the end is an error, the error is the result, and the half-written
+    /// file is gone. Before, the worker printed a message and returned, the
+    /// container was committed as if the extract were complete, and the
+    /// process exited 0 -- so a later run skipped the truncated file for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_that_cannot_be_extracted_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, xvd, job, _) = fixture(dir.path()).await;
+        let cut = job.content.offset + PAGE_SIZE as u64 + 7;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let out = dir.path().join("game");
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let url = format!("file://{}", path.display());
+
+        let err = fetch_files(
+            &reqwest::Client::new(),
+            &xvd,
+            vec![job],
+            &out,
+            &url,
+            [0; 32],
+            None,
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("does not contain this file"), "{err}");
+        assert!(!out.join("Content/data.pak").exists());
+    }
+
+    /// A damaged page in the source is refused, not installed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_damaged_page_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, xvd, job, _) = fixture(dir.path()).await;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[job.content.offset as usize + 2 * PAGE_SIZE + 1] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let out = dir.path().join("game");
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let url = format!("file://{}", path.display());
+
+        let err = fetch_files(
+            &reqwest::Client::new(),
+            &xvd,
+            vec![job],
+            &out,
+            &url,
+            [0; 32],
+            None,
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("does not match its hash tree"), "{err}");
+        assert!(!out.join("Content/data.pak").exists());
+    }
+
+    /// The first file that fails stops the others mid-write. None of them is
+    /// left half written: a file being replaced keeps its old contents, and no
+    /// temporary file is left behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_leaves_the_other_files_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, xvd, job, _) = fixture(dir.path()).await;
+        let out = dir.path().join("game");
+        std::fs::create_dir_all(out.join("Content")).unwrap();
+        std::fs::write(out.join("Content/data.pak"), b"the old, good copy").unwrap();
+        let failing = Job {
+            name: r"..\escaped.txt".into(),
+            content: SegmentFile {
+                offset: job.content.offset,
+                length: job.content.length,
+                data_hashs: vec![],
+                keep_encrypted: false,
+            },
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let url = format!("file://{}", path.display());
+
+        let err = fetch_files(
+            &reqwest::Client::new(),
+            &xvd,
+            vec![job, failing],
+            &out,
+            &url,
+            [0; 32],
+            Some(2),
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("refusing to install"), "{err}");
+        // Anything a dropped job had left running on a blocking thread.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            std::fs::read(out.join("Content/data.pak")).unwrap(),
+            b"the old, good copy"
+        );
+        let left: Vec<_> = std::fs::read_dir(out.join("Content"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["data.pak"]);
+    }
+
+    /// A name that climbs out of the destination is refused before anything is
+    /// written anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_named_outside_the_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, xvd, mut job, _) = fixture(dir.path()).await;
+        job.name = r"..\escaped.txt".into();
+        let out = dir.path().join("game");
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let url = format!("file://{}", path.display());
+
+        let err = fetch_files(
+            &reqwest::Client::new(),
+            &xvd,
+            vec![job],
+            &out,
+            &url,
+            [0; 32],
+            None,
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("refusing to install"), "{err}");
+        assert!(!dir.path().join("escaped.txt").exists());
+    }
+
+    /// An unreadable record is not a reason to stop: it is read as "nothing
+    /// installed" and everything is fetched. It used to panic on every run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_damaged_record_reads_as_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(".xodus-streaming.msixvc");
+        std::fs::write(&record, b"").unwrap();
+        assert!(read_installed(&record).await.is_err());
+        std::fs::write(&record, vec![0x5au8; 3 * 4096]).unwrap();
+        assert!(read_installed(&record).await.is_err());
+    }
 }

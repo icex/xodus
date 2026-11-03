@@ -19,6 +19,65 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
     Some(&version[..prefix_len])
 }
 
+/// Set to `1` to refuse a download when the package service lists only plain
+/// http CDN roots for it.
+pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
+
+/// Where to download a package file from, out of the CDN roots the package
+/// service lists.
+///
+/// An https root is taken if there is one. Otherwise the first root is used as
+/// it is, and so far that has meant plain `http://`: the Xbox package CDN hosts
+/// answer https with a certificate for other names, so asking them for the
+/// same path over https fails every time. Over http the pages are still
+/// checked against the package's hash tree, but the header that vouches for
+/// that tree is not, so a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses
+/// such a package instead. A root in any other scheme is refused.
+pub fn package_url(cdn_roots: &[String], relative_url: &str) -> Result<String, String> {
+    let url = package_url_with(
+        cdn_roots,
+        relative_url,
+        std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
+    )?;
+    if !has_scheme(&url, "https://") {
+        eprintln!(
+            "note: the package service lists only plain http for this package; its pages \
+             are checked against its hash tree, but nothing vouches for its header"
+        );
+    }
+    Ok(url)
+}
+
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+}
+
+fn package_url_with(
+    cdn_roots: &[String],
+    relative_url: &str,
+    require_https: bool,
+) -> Result<String, String> {
+    if let Some(root) = cdn_roots.iter().find(|root| has_scheme(root, "https://")) {
+        return Ok(format!("{root}{relative_url}"));
+    }
+    let Some(root) = cdn_roots.first() else {
+        return Err("the package service listed no download location for this package".into());
+    };
+    if !has_scheme(root, "http://") {
+        return Err(format!(
+            "refusing the download location {root}: only http and https are used"
+        ));
+    }
+    if require_https {
+        return Err(format!(
+            "refusing the download location {root}: it is plain http and \
+             {REQUIRE_HTTPS_CDN_ENV}=1 asks for https"
+        ));
+    }
+    Ok(format!("{root}{relative_url}"))
+}
+
 pub async fn get_content_id(
     client: &reqwest::Client,
     product: String,
@@ -110,17 +169,30 @@ pub async fn get_packages(
     tokens: &TokenManager,
     content_id: String,
 ) -> Result<PackageDetails, Box<dyn std::error::Error>> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
+    // Each of these used to be an unwrap or an expect, so being offline or
+    // signed out ended the client with a panic instead of a reason.
+    let dev_token = tokens
+        .get_device_sts_token()
+        .map_err(|e| format!("no device token ({e}); sign in again"))?;
     let Token::Legacy(dev_token) = dev_token else {
         return Err(Box::new(std::io::Error::other("Invalid STS token")));
     };
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let user_token = tokens
+        .get_user_sts_token()
+        .map_err(|e| format!("no user token ({e}); sign in again"))?;
     let Token::Legacy(legacy) = user_token else {
         return Err(Box::new(std::io::Error::other("Unsupported user token")));
     };
 
-    let xsts_token =
-        xodus::api::xbox::run(client, dev_token, legacy, "http://update.xboxlive.com").await;
+    let xsts_token = xodus::api::xbox::try_run_with_signer(
+        client,
+        dev_token,
+        legacy,
+        "http://update.xboxlive.com",
+        None,
+    )
+    .await
+    .map_err(|e| format!("could not sign in to the package service: {e}"))?;
 
     let response = client
         .get(format!(
@@ -133,9 +205,12 @@ pub async fn get_packages(
         )
         .send()
         .await
-        .unwrap();
+        .map_err(|e| format!("could not reach the package service: {e}"))?;
 
-    let res: PackageResponse = response.json().await.expect("Failed to get data");
+    let res: PackageResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("the package service sent an answer that could not be read: {e}"))?;
 
     let PackageResponse::Found(package) = res else {
         return Err(Box::new(std::io::Error::other(
@@ -167,5 +242,37 @@ mod tests {
         let mut with_build_id = package;
         with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
         assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
+    }
+
+    #[test]
+    fn packages_are_fetched_from_the_roots_the_service_lists() {
+        let roots = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let rel = "/8/abc/package.msixvc";
+
+        // A plain http root is used as it is: the CDN hosts do not answer
+        // https for their own names, so rewriting it would fail every install.
+        assert_eq!(
+            package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, false).unwrap(),
+            "http://assets1.xboxlive.com/8/abc/package.msixvc"
+        );
+        // An https root, wherever it is in the list, is preferred.
+        assert_eq!(
+            package_url_with(
+                &roots(&[
+                    "http://assets1.xboxlive.com",
+                    "HTTPS://assets2.xboxlive.com"
+                ]),
+                rel,
+                true
+            )
+            .unwrap(),
+            "HTTPS://assets2.xboxlive.com/8/abc/package.msixvc"
+        );
+        // Only when asked for is a plain http list refused.
+        assert!(package_url_with(&roots(&["http://assets1.xboxlive.com"]), rel, true).is_err());
+        // No roots, or one in another scheme, is an error rather than a panic.
+        assert!(package_url_with(&[], rel, false).is_err());
+        assert!(package_url_with(&roots(&["ftp://x"]), rel, false).is_err());
+        assert!(package_url_with(&roots(&["h"]), rel, false).is_err());
     }
 }

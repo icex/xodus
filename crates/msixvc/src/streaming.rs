@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io::{Error, ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::Stream;
@@ -11,6 +12,13 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
+/// How many times in a row a resumed connection may deliver nothing before the
+/// read fails. Each is waited for longer than the last, from `RESUME_DELAY` up
+/// to `RESUME_MAX_DELAY`.
+const RESUME_ATTEMPTS: u32 = 8;
+const RESUME_DELAY: Duration = Duration::from_secs(1);
+const RESUME_MAX_DELAY: Duration = Duration::from_secs(30);
+
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
 
@@ -18,6 +26,8 @@ struct ActiveHttpStream {
     next_offset: u64,
     end_offset: u64,
     stream: ByteStream,
+    /// Whether this connection has brought any bytes yet.
+    delivered: bool,
 }
 
 struct OpenedHttpStream {
@@ -36,6 +46,12 @@ pub struct HttpRead<'t> {
     pending_chunk: Option<Bytes>,
     pending_chunk_offset: usize,
     progress: Option<Box<dyn FnMut(u64, u64) + Send + 't>>,
+    /// Resumes in a row that delivered nothing. A server that accepts the
+    /// request and then closes the connection used to be asked again at once,
+    /// for ever.
+    empty_resumes: u32,
+    resume_delay: Duration,
+    resume_max_delay: Duration,
 }
 
 impl<'t> HttpRead<'t> {
@@ -60,10 +76,14 @@ impl<'t> HttpRead<'t> {
                 next_offset: initial.start,
                 end_offset: initial.len,
                 stream: initial.stream,
+                delivered: false,
             }),
             pending_chunk: None,
             pending_chunk_offset: 0,
             progress: progress.map(|v| Box::new(v) as Box<dyn FnMut(u64, u64) + Send + 't>),
+            empty_resumes: 0,
+            resume_delay: RESUME_DELAY,
+            resume_max_delay: RESUME_MAX_DELAY,
         })
     }
 
@@ -79,9 +99,41 @@ impl<'t> HttpRead<'t> {
         let client = self.client.clone();
         let url = self.url.clone();
         let range_start = if start == 0 { None } else { Some(start) };
+        let delay = if self.empty_resumes == 0 {
+            Duration::ZERO
+        } else {
+            self.resume_delay
+                .saturating_mul(1u32 << (self.empty_resumes - 1).min(16))
+                .min(self.resume_max_delay)
+        };
         self.pending_open = Some(Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             open_http_stream(client, url, range_start).await
         }));
+    }
+
+    /// The stream ended or failed before the end of the file. Count it if it
+    /// brought nothing, and stop once that has happened too often.
+    fn lost_stream(&mut self, delivered: bool, why: String) -> std::io::Result<()> {
+        self.active = None;
+        if delivered {
+            self.empty_resumes = 0;
+            return Ok(());
+        }
+        self.empty_resumes += 1;
+        if self.empty_resumes > RESUME_ATTEMPTS {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "the download stopped at byte {} of {}: {RESUME_ATTEMPTS} resumed \
+                     connections in a row delivered nothing ({why})",
+                    self.pos, self.len
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn poll_open_if_needed(
@@ -107,6 +159,7 @@ impl<'t> HttpRead<'t> {
                     next_offset: opened.start,
                     end_offset: opened.len,
                     stream: opened.stream,
+                    delivered: false,
                 });
                 Poll::Ready(Ok(()))
             }
@@ -173,6 +226,9 @@ impl<'t> AsyncRead for HttpRead<'t> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(chunk))) => {
                     active.next_offset += chunk.len() as u64;
+                    if !chunk.is_empty() {
+                        active.delivered = true;
+                    }
                     if active.next_offset > active.end_offset {
                         return Poll::Ready(Err(Error::new(
                             ErrorKind::InvalidData,
@@ -182,14 +238,21 @@ impl<'t> AsyncRead for HttpRead<'t> {
                     self.pending_chunk = Some(chunk);
                     self.pending_chunk_offset = 0;
                 }
-                Poll::Ready(Some(Err(_err))) => {
-                    self.active = None;
+                Poll::Ready(Some(Err(err))) => {
+                    let delivered = active.delivered;
+                    if let Err(err) = self.lost_stream(delivered, err.to_string()) {
+                        return Poll::Ready(Err(err));
+                    }
                     continue;
                 }
                 Poll::Ready(None) => {
-                    self.active = None;
+                    let delivered = active.delivered;
                     if self.pos >= self.len {
+                        self.active = None;
                         return Poll::Ready(Ok(()));
+                    }
+                    if let Err(err) = self.lost_stream(delivered, "connection closed".into()) {
+                        return Poll::Ready(Err(err));
                     }
                     continue;
                 }
@@ -710,6 +773,8 @@ mod tests {
         body: Arc<Vec<u8>>,
         first_body_limit: Option<usize>,
         resume_start_adjustment: i64,
+        /// Cut every resumed response to this many bytes of body.
+        resume_body_limit: Option<usize>,
         requests: Arc<Mutex<Vec<RequestRecord>>>,
         request_count: Arc<AtomicUsize>,
     }
@@ -742,6 +807,15 @@ mod tests {
         first_body_limit: Option<usize>,
         resume_start_adjustment: i64,
     ) -> io::Result<TestServer> {
+        spawn_server_with(body, first_body_limit, resume_start_adjustment, None).await
+    }
+
+    async fn spawn_server_with(
+        body: Vec<u8>,
+        first_body_limit: Option<usize>,
+        resume_start_adjustment: i64,
+        resume_body_limit: Option<usize>,
+    ) -> io::Result<TestServer> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -749,6 +823,7 @@ mod tests {
             body: Arc::new(body),
             first_body_limit,
             resume_start_adjustment,
+            resume_body_limit,
             requests: requests.clone(),
             request_count: Arc::new(AtomicUsize::new(0)),
         };
@@ -823,8 +898,11 @@ mod tests {
                 } else {
                     (start as i64 + config.resume_start_adjustment) as u64
                 };
-                let body = config.body[adjusted_start as usize..].to_vec();
+                let mut body = config.body[adjusted_start as usize..].to_vec();
                 let content_length = body.len();
+                if let Some(limit) = config.resume_body_limit {
+                    body.truncate(limit);
+                }
                 (
                     "HTTP/1.1 206 Partial Content\r\n".to_owned(),
                     format!(
@@ -970,5 +1048,36 @@ mod tests {
         let err = file.read_exact(&mut buf).await.unwrap_err();
         assert!(err.to_string().contains("range resume mismatch"));
         let _ = std::fs::remove_file(cache);
+    }
+
+    /// A server that takes the resumed request and then sends nothing used to
+    /// be asked again straight away, for ever: the read never returned and the
+    /// process spun. It now waits between attempts and gives up.
+    #[tokio::test]
+    async fn resumes_that_bring_nothing_are_given_up_on() {
+        let server = spawn_server_with(test_body(), Some(96), 0, Some(0))
+            .await
+            .unwrap();
+        let mut http = HttpRead::open(reqwest::Client::new(), &server.url, Some(|_, _| {}))
+            .await
+            .unwrap();
+        http.resume_delay = std::time::Duration::from_millis(1);
+        http.resume_max_delay = std::time::Duration::from_millis(4);
+
+        let mut buf = vec![0u8; 256];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            http.read_exact(&mut buf),
+        )
+        .await
+        .expect("still resuming after 20 s");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("delivered nothing"), "{err}");
+        // The first request and then one per allowed resume, plus the one
+        // that tipped it over.
+        assert_eq!(
+            server.request_ranges().len(),
+            1 + super::RESUME_ATTEMPTS as usize + 1
+        );
     }
 }

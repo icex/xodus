@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use xodus::models::packagespc::PackageFile;
 use xodus::tokens::TokenManager;
 
-use crate::package::{get_content_id, get_packages};
+use crate::package::{get_content_id, get_packages, package_url};
 
 pub async fn run(
     client: &reqwest::Client,
@@ -55,39 +55,85 @@ pub async fn run(
     };
     println!();
     for file in files {
-        let url = format!(
-            "{}{}",
-            file.cdn_root_paths.first().unwrap(),
-            file.relative_url
-        );
+        let url = match package_url(&file.cdn_root_paths, &file.relative_url) {
+            Ok(url) => url,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
         if dry_run {
             println!("{}", url);
             continue;
         }
+        // Saved in the current directory under the name the service gives,
+        // which must therefore be a plain file name and nothing more.
+        let name = match msixvc::xvd::package_relative_path(&file.file_name) {
+            Ok(name) if name.components().count() == 1 => name,
+            Ok(_) => {
+                eprintln!(
+                    "refusing to save {:?}: not a plain file name",
+                    file.file_name
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
 
         let progress_bar = ProgressBar::new(file.file_size as u64).with_style(
             ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) ({eta})").unwrap()
             .progress_chars("#>-")
         );
 
-        let res = client
-            .get(url)
+        let res = match client
+            .get(&url)
             .send()
             .await
-            .expect("Failed to request the download");
-        let mut file = tokio::fs::OpenOptions::new()
+            .and_then(|res| res.error_for_status())
+        {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("could not download {url}: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut out = match tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(file.file_name)
+            .open(&name)
             .await
-            .unwrap();
+        {
+            Ok(out) => out,
+            Err(err) => {
+                eprintln!("could not write {}: {err}", name.display());
+                return ExitCode::FAILURE;
+            }
+        };
         let mut stream = res.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chk = chunk.expect("Failed to stream file");
-            file.write_all(&chk).await.expect("Failed to write to file");
-            progress_bar.inc(chk.len() as u64);
+            let written = match chunk {
+                Ok(chk) => out.write_all(&chk).await.map(|()| chk.len()),
+                Err(err) => {
+                    eprintln!("the download of {url} stopped: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match written {
+                Ok(n) => progress_bar.inc(n as u64),
+                Err(err) => {
+                    eprintln!("could not write {}: {err}", name.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if let Err(err) = out.flush().await {
+            eprintln!("could not write {}: {err}", name.display());
+            return ExitCode::FAILURE;
         }
 
         progress_bar.finish();

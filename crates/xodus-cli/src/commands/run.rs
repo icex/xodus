@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use msixvc::layout::PAGE_SIZE;
-use msixvc::xvd::{SegmentFile, XvdFile};
+use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
@@ -214,9 +214,18 @@ pub async fn run(
         if !file.1.keep_encrypted {
             continue;
         }
-        let mut game_exe = File::from_std(make_temp_file(&mount_dir, file.0).unwrap());
+        // The name comes from the package; it must not reach outside the
+        // game's folder, here any more than when it was installed.
+        let relative = match package_relative_path(file.0) {
+            Ok(relative) => relative,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let source_path = out.join(relative);
 
-        let source_path = out.join(file.0.replace("\\", "/"));
+        let mut game_exe = File::from_std(make_temp_file(&mount_dir, file.0).unwrap());
 
         let mut i = File::open(&source_path).await.unwrap();
 

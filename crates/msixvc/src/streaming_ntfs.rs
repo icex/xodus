@@ -79,6 +79,17 @@ where
         if name == "." || name == ".." {
             continue;
         }
+        // NTFS does not allow a separator inside a name, so one that has one
+        // was made to be split -- `..\..\x` as a single name is a path that
+        // climbs out of wherever it is extracted to. Refused here rather than
+        // trusted to be caught later.
+        if name.contains(['/', '\\', '\0']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("NTFS name {name:?} holds a path separator or NUL"),
+            )
+            .into());
+        }
 
         let path = join_ntfs_path(base_path, name.as_ref());
         let file = entry.to_file(ntfs, fs)?;
