@@ -3,10 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use std::vec;
 
-use fs2::available_space;
-use futures_util::{TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use msixvc::layout::PAGE_SIZE;
 use msixvc::signature::XvdSigningKey;
@@ -16,7 +13,7 @@ use msixvc::xvd::{
     package_relative_path,
 };
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncSeek};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
@@ -26,10 +23,7 @@ use crate::package::{
     HeaderCheck, get_content_id, get_packages, header_anchor, package_url, unanchored_note,
 };
 
-struct Job {
-    name: String,
-    content: SegmentFile,
-}
+type Job = crate::download_plan::Entry;
 
 /// What the package header is held to before anything in it is believed.
 #[derive(Default)]
@@ -57,15 +51,14 @@ impl HeaderTrust {
 /// none and `XODUS_REQUIRE_SIGNED_PACKAGE=1`.
 async fn signing_key(fetch: crate::xvd_key::Fetch) -> Result<Option<XvdSigningKey>, ExitCode> {
     crate::xvd_key::for_install(fetch).await.map_err(|err| {
+        crate::download_session::diagnostic("metadata-invalid", 0);
         eprintln!("{err}");
         ExitCode::FAILURE
     })
 }
 
 enum ProgressEvent {
-    Started { id: usize, name: String, total: u64 },
-    Advanced { id: usize, delta: u64 },
-    Finished { id: usize },
+    Advanced { delta: u64 },
     UpdateRemaining { name: String, total: u64 },
     UpdateStatus { name: String },
 }
@@ -236,7 +229,6 @@ pub async fn run(
             Some(move |c: u64, _| {
                 if progress_tx
                     .try_send(ProgressEvent::Advanced {
-                        id: usize::MAX,
                         delta: c.saturating_sub(pos),
                     })
                     .is_ok()
@@ -249,6 +241,7 @@ pub async fn run(
         {
             Ok(http_file) => http_file,
             Err(err) => {
+                crate::download_session::diagnostic("metadata-network", 0);
                 eprintln!("could not start the download from {url}: {err}");
                 return ExitCode::FAILURE;
             }
@@ -362,30 +355,11 @@ where
         ));
 
         total_progess.set_message("Initializing");
-        let mut bars: HashMap<usize, ProgressBar> = HashMap::new();
         let mut json = JsonProgress::from_env();
 
         while let Some(event) = rx.recv().await {
             match event {
-                ProgressEvent::Started { id, name, total } => {
-                    let cur_progess = multi_progress.add(ProgressBar::new(total).with_style(
-                        ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
-                        .progress_chars("#>-")
-                    ));
-                    cur_progess.set_message(name);
-                    bars.insert(id, cur_progess);
-                }
-                ProgressEvent::Advanced { id, delta } => {
-                    if let Some(bar) = bars.get(&id) {
-                        bar.inc(delta);
-                    }
-                    total_progess.inc(delta);
-                }
-                ProgressEvent::Finished { id } => {
-                    if let Some(bar) = bars.remove(&id) {
-                        bar.finish_and_clear();
-                    }
-                }
+                ProgressEvent::Advanced { delta } => total_progess.inc(delta),
                 ProgressEvent::UpdateRemaining { name, total } => {
                     total_progess.set_message(name);
                     total_progess.set_length(total_progess.position() + total);
@@ -447,6 +421,7 @@ fn stopped<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> String + '_ {
 /// Counted in characters, not bytes. Slicing at a byte offset panicked on a
 /// name with anything but ASCII near its end -- deterministically, so a title
 /// with such a file could never be installed.
+#[cfg(test)]
 fn shown_name(path: &str) -> String {
     const WIDTH: usize = 30;
     if path.chars().count() <= WIDTH {
@@ -509,6 +484,7 @@ where
 {
     let parsed = XvdFile::parse_checked(remote_file, trust.checks()).await;
     parsed.map_err(|err| {
+        crate::download_session::diagnostic("metadata-invalid", 0);
         if let Some(mismatch) = err.downcast_ref::<TopHashMismatch>() {
             format!(
                 "refusing this download: {mismatch}, which the package service gave as its \
@@ -603,7 +579,17 @@ where
 
     std::fs::create_dir_all(out).map_err(|e| format!("could not create {}: {e}", out.display()))?;
 
+    let _installation = crate::download_state::writer(out).map_err(|e| {
+        crate::download_session::diagnostic("installation-busy", 0);
+        e.to_string()
+    })?;
+    let recovering = crate::download_state::incomplete(out).map_err(|e| e.to_string())?;
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
+    if std::fs::symlink_metadata(&cache_path)
+        .is_ok_and(|m| !m.is_file() || m.file_type().is_symlink())
+    {
+        return Err("Refusing an unsafe package metadata cache".into());
+    }
     let final_path = out.join(".xodus-streaming.msixvc");
 
     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
@@ -671,7 +657,10 @@ where
         market.unwrap_or("neutral".to_string()),
     )
     .await;
-    let (key, game_splicense) = license.map_err(|err| err.to_string())?;
+    let (key, game_splicense) = license.map_err(|err| {
+        crate::download_session::diagnostic("license", 0);
+        err.to_string()
+    })?;
     if game_splicense.content_keys.len() != 1 {
         return Err(format!(
             "unexpected number of content keys {}",
@@ -687,38 +676,13 @@ where
         .map_err(|e| format!("could not unpack the content key: {e}"))?;
 
     let jobs: Vec<Job> = rfiles
-        .iter()
-        .filter(|(k, v1)| needs_download(out, k, v1, lfiles.get(*k)))
-        .map(|(n, v)| Job {
-            name: n.clone(),
-            content: SegmentFile {
-                offset: v.offset,
-                length: v.length,
-                data_hashs: vec![],
-                keep_encrypted: v.keep_encrypted,
-            },
+        .into_iter()
+        .filter(|(name, content)| {
+            recovering || needs_download(out, name, content, lfiles.get(name))
         })
+        .map(|(name, content)| Job { name, content })
         .collect();
     let total_size: u64 = jobs.iter().map(|job| job.content.length).sum();
-
-    let required_free_space = total_size;
-    let available_free_space = available_space(out).map_err(|err| {
-        format!(
-            "failed to determine available space for {}: {}",
-            out.display(),
-            err
-        )
-    })?;
-
-    if available_free_space < required_free_space {
-        return Err(format!(
-            "not enough free disk space on {}: need {} bytes, have {} bytes (files: {})",
-            out.display(),
-            required_free_space,
-            available_free_space,
-            total_size
-        ));
-    }
 
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
@@ -730,52 +694,22 @@ where
     // Stops at the first file that fails, and that failure is the result. The
     // cache is not committed unless every file arrived, so the next run still
     // sees the old record and fetches whatever this one did not finish.
-    fetch_files(client, &remote_xvd, jobs, out, url, *full_key, parallel, tx).await?;
-
-    commit(out, &cache_path, &final_path)
-}
-
-/// A file being written under a temporary name beside the one it is for, and
-/// removed when dropped unless it was put in place. The first file that fails
-/// drops every other job mid-write; writing over the real name would leave
-/// those files half written -- for an update, the good copies they were
-/// replacing truncated -- until a later run noticed.
-struct PartFile {
-    path: std::path::PathBuf,
-    armed: bool,
-}
-
-impl PartFile {
-    /// Create (or empty) the temporary file for `target`. Opened here rather
-    /// than through tokio, so that once this returns the guard owns the file:
-    /// an open still running on a blocking thread when the job is dropped
-    /// would create it after the guard had removed it.
-    fn create(target: &Path, id: usize) -> Result<(Self, File), String> {
-        let path = target.with_file_name(format!(".xodus-part-{id}"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-        Ok((Self { path, armed: true }, File::from_std(file)))
-    }
-
-    /// Rename the finished file over `target`.
-    fn put_in_place(mut self, target: &Path) -> Result<(), String> {
-        std::fs::rename(&self.path, target)
-            .map_err(|e| format!("could not write {}: {e}", target.display()))?;
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for PartFile {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+    let session = fetch_files_with_old(
+        client,
+        &remote_xvd,
+        jobs,
+        &lfiles,
+        out,
+        url,
+        *full_key,
+        parallel,
+        tx,
+    )
+    .await?;
+    let committed = commit(out, &cache_path, &final_path)
+        .and_then(|()| crate::download_state::finish(out).map_err(|e| e.to_string()));
+    session.finish(committed.is_ok());
+    committed
 }
 
 /// Fetch every file in `jobs` into `out`, `parallel` at a time, from `url`
@@ -785,6 +719,7 @@ impl Drop for PartFile {
 /// written under a temporary name and renamed into place only once all of it
 /// is written, so neither the file that failed nor one stopped because of it
 /// is left half written, and a file being replaced keeps its old contents.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn fetch_files(
     client: &reqwest::Client,
@@ -796,102 +731,47 @@ async fn fetch_files(
     parallel: Option<usize>,
     tx: &Sender<ProgressEvent>,
 ) -> Result<(), String> {
-    stream::iter(jobs.into_iter().enumerate().map(Ok::<_, String>))
-        .try_for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
-            let tx = tx.clone();
-            let client = client.clone();
-            async move {
-                let relative = package_relative_path(&job.name)
-                    .map_err(|e| format!("refusing to install this package: {e}"))?;
-                let target_file = out.join(relative);
-                if let Some(folder) = target_file.parent() {
-                    std::fs::create_dir_all(folder)
-                        .map_err(|e| format!("could not create {}: {e}", folder.display()))?;
-                }
-                let (part, mut fout) = PartFile::create(&target_file, id)?;
-                let mut lp = 0;
+    fetch_files_with_old(
+        client,
+        xvd,
+        jobs,
+        &HashMap::new(),
+        out,
+        url,
+        full_key,
+        parallel,
+        tx,
+    )
+    .await
+    .map(|_| ())
+}
 
-                let progress = |pos: u64, _| {
-                    if tx
-                        .try_send(ProgressEvent::Advanced {
-                            id,
-                            delta: pos.saturating_sub(lp),
-                        })
-                        .is_ok()
-                    {
-                        lp = pos;
-                    }
-                };
-                tx.send(ProgressEvent::Started {
-                    id,
-                    name: shown_name(&job.name),
-                    total: job.content.length,
-                })
-                .await
-                .ok();
-
-                let result = if let Some(fpath) = url.strip_prefix("file://") {
-                    match File::open(&fpath).await {
-                        Err(err) => Err(format!("could not open {fpath}: {err}")),
-                        // A local container is often a *prefix* of the
-                        // package -- the streaming install keeps only what it
-                        // read. Extracting from one therefore runs off the end
-                        // partway through, and `early eof` arriving as a panic
-                        // reads as a bug in the extractor rather than as "this
-                        // container does not go that far".
-                        Ok(mut i) => xvd
-                            .extract_file(&mut i, &mut fout, &job.content, full_key, progress)
-                            .await
-                            .map_err(|err| {
-                                format!(
-                                    "{}: {err}\n  {fpath} does not contain this file. A container \
-                                     left by a streaming install holds only the part of the \
-                                     package that was read; extracting the whole title needs \
-                                     the package, not the cache.",
-                                    job.name
-                                )
-                            }),
-                    }
-                } else {
-                    xvd.download_file_http(
-                        &client,
-                        url,
-                        &mut fout,
-                        &job.content,
-                        full_key,
-                        progress,
-                    )
-                    .await
-                    .map_err(|err| format!("{}: {err}", job.name))
-                };
-                // tokio hands writes to another thread; an error from the last
-                // of them (a full disk, say) only shows up here.
-                let result = match result {
-                    Ok(()) => fout
-                        .flush()
-                        .await
-                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
-                    Err(err) => Err(err),
-                };
-                #[cfg(not(target_os = "linux"))]
-                let result = match result {
-                    Ok(()) => fout
-                        .sync_all()
-                        .await
-                        .map_err(|e| format!("could not write {}: {e}", target_file.display())),
-                    Err(err) => Err(err),
-                };
-                // Half a file is not left looking like a file: `part` removes
-                // it on an error, and when this job is dropped because
-                // another one failed.
-                result?;
-                drop(fout);
-                part.put_in_place(&target_file)?;
-                tx.send(ProgressEvent::Finished { id }).await.ok();
-                Ok(())
-            }
-        })
-        .await
+#[allow(clippy::too_many_arguments)]
+async fn fetch_files_with_old(
+    client: &reqwest::Client,
+    xvd: &XvdFile,
+    jobs: Vec<Job>,
+    old: &HashMap<String, SegmentFile>,
+    out: &Path,
+    url: &str,
+    key: [u8; 32],
+    parallel: Option<usize>,
+    tx: &Sender<ProgressEvent>,
+) -> Result<crate::download_session::Session, String> {
+    crate::download_plan::execute(
+        client,
+        xvd,
+        jobs,
+        old,
+        out,
+        url,
+        key,
+        parallel.unwrap_or(4),
+        |delta| {
+            let _ = tx.try_send(ProgressEvent::Advanced { delta });
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

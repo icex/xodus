@@ -749,12 +749,17 @@ async fn open_range(
             .and_then(|(s, _)| s.parse::<u64>().ok())
             == Some(start);
         if !starts_right {
+            eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-range 0");
             return Err(RangeError::Retry(format!(
                 "the server answered a different range than bytes={start}-{end}"
             )));
         }
         return Ok(Box::pin(response.bytes_stream()));
     }
+    eprintln!(
+        "FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-status {}",
+        status.as_u16()
+    );
     let message = format!("the server answered {status} for bytes={start}-{end}");
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
@@ -1337,6 +1342,54 @@ impl XvdFile {
         Ok(sfile.offset / PAGE_SIZE as u64)
     }
 
+    /// A stage belongs to the exact signed container and authenticated tree.
+    pub fn transfer_stamp(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(self.header.signature);
+        hash.update(self.header.top_hash_block_hash);
+        hash.finalize().into()
+    }
+
+    /// Reconstruct the package's stored page from an installed page. A local
+    /// candidate is useful only if the new container's authenticated tree
+    /// accepts it with the new licence key and page encryption parameters.
+    pub fn accepts_installed_page(
+        &self,
+        file: &SegmentFile,
+        index: u64,
+        key: [u8; 32],
+        installed: &[u8],
+    ) -> bool {
+        if !self.verified
+            || installed.len() != PAGE_SIZE
+            || index >= file.length.div_ceil(PAGE_SIZE as u64)
+        {
+            return false;
+        }
+        let Ok(first) = Self::first_page_of(file) else {
+            return false;
+        };
+        let absolute = first + index;
+        let mut encoded = [0u8; PAGE_SIZE];
+        encoded.copy_from_slice(installed);
+        if !file.keep_encrypted {
+            if let Some((_, tweak, tweak_cipher, _)) = self.file_crypto(file, key, true) {
+                let Some(unit) = self.hashes.unit(absolute) else {
+                    return false;
+                };
+                let data_key: [u8; 16] = key[16..].try_into().unwrap();
+                let cipher = Aes128Enc::new((&data_key).into());
+                crate::crypt::encrypt_page_xts(
+                    &mut encoded,
+                    tweak.with_data_unit(unit),
+                    &tweak_cipher,
+                    &cipher,
+                );
+            }
+        }
+        self.hashes.check(absolute, &encoded).is_ok()
+    }
+
     pub async fn download_file_http<Writer, Progress>(
         &self,
         client: &reqwest::Client,
@@ -1417,6 +1470,7 @@ impl XvdFile {
             let Some(s) = stream.as_mut() else {
                 if failures > 0 {
                     if last_good.elapsed() >= policy.give_up_after {
+                        eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-timeout 0");
                         return Err(Box::new(Error::new(
                             ErrorKind::TimedOut,
                             format!(
@@ -1484,6 +1538,7 @@ impl XvdFile {
                         _ => 1,
                     };
                     if count >= policy.bad_page_limit {
+                        eprintln!("FERESTRE_TRANSFER_DIAGNOSTIC_V1 transfer-integrity 0");
                         return Err(Box::new(Error::new(
                             ErrorKind::InvalidData,
                             format!("{err}, {count} times over; giving up on this file"),
@@ -1762,6 +1817,66 @@ mod tests {
 
     async fn parse_verified(bytes: &[u8]) -> Result<XvdFile, Box<dyn std::error::Error>> {
         XvdFile::parse_verified(Cursor::new(bytes.to_vec())).await
+    }
+
+    #[tokio::test]
+    async fn installed_pages_are_accepted_only_by_the_authenticated_target_tree() {
+        use super::page_digest;
+        let package = package();
+        let mut xvd = parse_verified(&package.bytes).await.unwrap();
+        let (mut file, bytes) = sample_file(&package);
+        assert!(xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..PAGE_SIZE]));
+        let mut changed = bytes[..PAGE_SIZE].to_vec();
+        changed[100] ^= 1;
+        // A forged comparison hint cannot override the authenticated tree.
+        file.data_hashs = vec![page_digest(&changed)];
+        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &changed));
+        assert!(!xvd.accepts_installed_page(&file, u64::MAX, [0; 32], &bytes[..PAGE_SIZE]));
+        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..100]));
+        xvd.verified = false;
+        assert!(!xvd.accepts_installed_page(&file, 0, [0; 32], &bytes[..PAGE_SIZE]));
+    }
+
+    #[tokio::test]
+    async fn plaintext_reuse_uses_the_new_key_region_and_data_unit() {
+        use super::{Aes128Enc, EncryptedSectionInfo, TweakGenerator, XvcRegionId, page_digest};
+        use aes::cipher::KeyInit;
+        let package = package();
+        let mut xvd = parse_verified(&package.bytes).await.unwrap();
+        let (file, bytes) = sample_file(&package);
+        let clear = &bytes[..PAGE_SIZE];
+        let absolute = file.offset / PAGE_SIZE as u64;
+        let index = xvd.hashes.index(absolute).unwrap();
+        let region = XvcRegionId::Other(17);
+        let content = uuid::Uuid::from_bytes([0x39; 16]);
+        let key = [0x81; 32];
+        let tweak_key: [u8; 16] = key[..16].try_into().unwrap();
+        let data_key: [u8; 16] = key[16..].try_into().unwrap();
+        let mut encrypted = [0; PAGE_SIZE];
+        encrypted.copy_from_slice(clear);
+        crate::crypt::encrypt_page_xts(
+            &mut encrypted,
+            TweakGenerator::new(region, content).with_data_unit(400),
+            &Aes128Enc::new((&tweak_key).into()),
+            &Aes128Enc::new((&data_key).into()),
+        );
+        xvd.encrypted_section_infos = vec![EncryptedSectionInfo {
+            section_offset: file.offset,
+            section_length: file.length,
+            header_id: region,
+            vduid: content,
+            first_segment_index: 0,
+        }];
+        // Isolate page reconstruction from the separately tested tree parser.
+        xvd.hashes.units[index] = 400;
+        xvd.hashes.hashes[index] = page_digest(&encrypted);
+        assert!(xvd.accepts_installed_page(&file, 0, key, clear));
+        assert!(!xvd.accepts_installed_page(&file, 0, [0x82; 32], clear));
+        xvd.hashes.units[index] = 401;
+        assert!(!xvd.accepts_installed_page(&file, 0, key, clear));
+        xvd.hashes.units[index] = 400;
+        xvd.encrypted_section_infos[0].header_id = XvcRegionId::Other(18);
+        assert!(!xvd.accepts_installed_page(&file, 0, key, clear));
     }
 
     #[test]

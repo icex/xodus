@@ -6,6 +6,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod commands;
+mod download_plan;
+mod download_session;
+mod download_state;
 mod license;
 mod package;
 mod webview;

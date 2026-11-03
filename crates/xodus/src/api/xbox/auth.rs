@@ -42,6 +42,12 @@ async fn authenticate_xbox_user_at(
         }
         _ => response,
     };
+    if !response.status().is_success() {
+        eprintln!(
+            "FERESTRE_TRANSFER_DIAGNOSTIC_V1 authentication {}",
+            response.status().as_u16()
+        );
+    }
     response.error_for_status()?.json().await
 }
 

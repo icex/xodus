@@ -145,6 +145,14 @@ pub async fn run(
     exe: Option<String>,
     market: Option<String>,
 ) -> ExitCode {
+    let _installation = match crate::download_state::player(std::path::Path::new(&source)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
