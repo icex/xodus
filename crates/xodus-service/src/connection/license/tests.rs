@@ -215,15 +215,19 @@ async fn offline_service_fixture() {
         let url = url.clone();
         let client = client.clone();
         tokio::spawn(async move {
-            let mut header = [0; 8];
-            if socket.read_exact(&mut header).await.is_err() {
-                return;
-            }
-            assert_eq!(&header[..4], b"XSDX");
-            let message = u16::from_le_bytes([header[4], header[5]]);
-            let mut bytes = vec![0; u16::from_le_bytes([header[6], header[7]]) as usize];
-            socket.read_exact(&mut bytes).await.unwrap();
+            let mut magic = [0; 4];
+            if socket.read_exact(&mut magic).await.is_err() { return; }
+            assert_eq!(&magic, b"XSDX");
+            let (message, bytes) = super::super::xml::read_request(&mut socket).await.unwrap();
+            let message = message as u16;
             let payload = if message == 5 {
+                let req: xodus::models::xgameruntime::xuser::XSTSTokenRequest =
+                    quick_xml::de::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+                if req.url == "https://fixture.invalid/large" {
+                    let body = STANDARD.decode(req.body_base64).unwrap();
+                    assert_eq!(body.len(), 100000);
+                    assert!(body.iter().enumerate().all(|(n, b)| *b == (n % 251) as u8));
+                }
                 b"<XSTSTokenResponse><Token>fixture-auth</Token><Signature>fixture-signature</Signature><Xuid>1</Xuid><Gamertag>Fixture</Gamertag><Expiry>4102444800</Expiry></XSTSTokenResponse>".to_vec()
             } else {
                 assert_eq!(message, 7);

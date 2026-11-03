@@ -273,18 +273,39 @@ struct CachedToken {
     expiry: i64,
 }
 
+// Extended XSTS frames retain the old framing for every small request. Only
+// type 0x8005 uses a 0xffff marker followed by a little-endian u32 length.
+// Bound allocation before reading any caller-controlled payload.
+const MAX_EXTENDED_XSTS: usize = 8 * 1024 * 1024;
+pub(super) async fn read_request<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> tokio::io::Result<(XodusMessageType, Vec<u8>)> {
+    let mut kind = reader.read_u16_le().await?;
+    let short_size = reader.read_u16_le().await?;
+    let size = if kind == 0x8005 && short_size == u16::MAX {
+        kind = 5;
+        let size = reader.read_u32_le().await? as usize;
+        if size <= u16::MAX as usize || size > MAX_EXTENDED_XSTS {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid extended XSTS size"));
+        }
+        size
+    } else {
+        if kind & 0x8000 != 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid extended frame"));
+        }
+        short_size as usize
+    };
+    let mut buffer = vec![0; size];
+    reader.read_exact(&mut buffer).await?;
+    Ok((XodusMessageType::try_from(kind as i32).unwrap_or_default(), buffer))
+}
+
 pub async fn handle(
     socket: &mut tokio::net::UnixStream,
     context: &mut SimpleContext,
 ) -> tokio::io::Result<()> {
     tracing::debug!("Parsing XML");
-    let message_type = socket.read_u16_le().await?;
-    let message_size = socket.read_u16_le().await?;
-    let mut buffer = vec![0; message_size as usize];
-    tracing::debug!("Reading buffer {message_size}");
-    socket.read_exact(&mut buffer).await?;
-    tracing::debug!("Read buffer");
-    let message_type = XodusMessageType::try_from(message_type as i32).unwrap_or_default();
+    let (message_type, buffer) = read_request(socket).await?;
 
     let out_buf = match parse_message(context, message_type, buffer).await {
         Ok(buf) => buf,
@@ -657,3 +678,35 @@ pub async fn parse_message(
 #[cfg(test)]
 #[path = "xml_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+    async fn decode(kind: u16, marker: u16, length: Option<u32>, payload: &[u8]) -> std::io::Result<(XodusMessageType, Vec<u8>)> {
+        let mut wire = kind.to_le_bytes().to_vec();
+        wire.extend(marker.to_le_bytes());
+        if let Some(length) = length { wire.extend(length.to_le_bytes()); }
+        wire.extend(payload);
+        read_request(&mut wire.as_slice()).await
+    }
+    #[tokio::test]
+    async fn preserves_legacy_frames_and_full_extended_body() {
+        let payload = b"legacy request";
+        let (kind, result) = decode(5, payload.len() as u16, None, payload).await.unwrap();
+        assert_eq!(kind, XodusMessageType::XstsTokenRequest);
+        assert_eq!(result, payload);
+        let payload: Vec<_> = (0..100000).map(|n| (n % 251) as u8).collect();
+        let (kind, result) = decode(0x8005, 0xffff, Some(payload.len() as u32), &payload).await.unwrap();
+        assert_eq!(kind, XodusMessageType::XstsTokenRequest);
+        assert_eq!(result, payload);
+    }
+    #[tokio::test]
+    async fn rejects_invalid_or_incomplete_extended_frames() {
+        for length in [0, 65535, (MAX_EXTENDED_XSTS + 1) as u32] {
+            assert_eq!(decode(0x8005, 0xffff, Some(length), &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        }
+        assert_eq!(decode(0x8005, 2, None, &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(decode(0x8007, 0xffff, None, &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(decode(0x8005, 0xffff, Some(70000), b"truncated").await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+}
