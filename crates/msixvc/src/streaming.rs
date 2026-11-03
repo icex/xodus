@@ -1114,7 +1114,7 @@ mod tests {
         let package = crate::xvd::testing::package();
         let cache = cache_path("resume-authentication");
         let mut corrupt = package.bytes.clone();
-        corrupt[package.tree_start + 32] ^= 1;
+        corrupt[package.tree_start * 4096 + 32] ^= 1;
         std::fs::write(&cache, corrupt).unwrap();
         let mut reader = PrefixCacheFile::resumable(
             std::io::Cursor::new(package.bytes.clone()),
