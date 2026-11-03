@@ -97,6 +97,11 @@ enum SubCommand {
         )]
         title_client_id: Option<String>,
     },
+    #[command(about = "Show the player as playing a game, or read the status friends see")]
+    Presence {
+        #[command(subcommand)]
+        action: PresenceAction,
+    },
     #[command(about = "Report the available version for an installed MSIXVC package")]
     Update {
         #[arg(help = "ContentId from the installed package header")]
@@ -179,6 +184,34 @@ enum SubCommand {
     #[command(about = "Decode SPLicenseBlock")]
     SpLicense {
         block: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PresenceAction {
+    #[command(
+        about = "Keep the game's presence alive until stdin closes or SIGTERM, then remove it"
+    )]
+    Run {
+        #[arg(long, default_value_t = false, help = "Emit JSON lines")]
+        json: bool,
+        #[arg(
+            long,
+            help = "The installed game directory holding MicrosoftGame.config"
+        )]
+        game_dir: Option<std::path::PathBuf>,
+        #[arg(long, help = "Decimal TitleId, instead of reading the game directory")]
+        title_id: Option<i64>,
+        #[arg(
+            long,
+            help = "The title's MSAAppId, instead of reading the game directory"
+        )]
+        title_client_id: Option<String>,
+    },
+    #[command(about = "Read the signed-in account's own presence")]
+    Get {
+        #[arg(long, default_value_t = false, help = "Emit JSON")]
+        json: bool,
     },
 }
 
@@ -391,6 +424,35 @@ async fn main() -> ExitCode {
                 Err(message) => {
                     eprintln!("{message}");
                     std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        SubCommand::Presence { action } => {
+            // Its own client: the shared one logs connection traffic at trace
+            // level, and a heartbeat's traffic is an Authorization header.
+            let client = reqwest::ClientBuilder::new()
+                .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or(client);
+            match action {
+                PresenceAction::Run {
+                    json,
+                    game_dir,
+                    title_id,
+                    title_client_id,
+                } => {
+                    commands::presence::run(
+                        &client,
+                        &tokens,
+                        json,
+                        game_dir,
+                        title_id,
+                        title_client_id,
+                    )
+                    .await
+                }
+                PresenceAction::Get { json } => {
+                    commands::presence::get(&client, &tokens, json).await
                 }
             }
         }

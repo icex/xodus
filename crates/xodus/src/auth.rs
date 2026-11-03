@@ -196,9 +196,14 @@ async fn test_minecraft_win_auth() {
     crate::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
 
-    let (_, resp, _) = do_sisu(&client, &tokens, "0000000040159362", 896928775)
-        .await
-        .expect("ok");
+    let (_, resp, _) = do_sisu(
+        &client,
+        &tokens,
+        MINECRAFT_WIN_CLIENT_ID,
+        MINECRAFT_WIN_TITLE_ID,
+    )
+    .await
+    .expect("ok");
 
     println!("title {}", resp.title_token.token);
     println!("user {}", resp.user_token.token);
@@ -335,17 +340,27 @@ mod win32_identity_tests {
     }
 }
 
-/// The Xbox app's own identity: a title claim, but for the Xbox app rather than
-/// for whatever is running. Services that only ask "is there a title claim at
-/// all" accept it; services that check *which* title do not.
-pub const XBOX_APP_CLIENT_ID: &str = "0000000040159362";
-pub const XBOX_APP_TITLE_ID: i64 = 896928775;
+/// Minecraft for Windows' identity, not the Xbox app's: this MSA client id and
+/// TitleId are the pair `test_minecraft_win_auth` above signs in with. A token
+/// minted from it claims Minecraft, so a service that shows the title, such as
+/// presence, shows Minecraft. Only services that ask "is there a title claim
+/// at all" are satisfied by it; services that check *which* title are not.
+pub const MINECRAFT_WIN_CLIENT_ID: &str = "0000000040159362";
+pub const MINECRAFT_WIN_TITLE_ID: i64 = 896928775;
 
+/// A title-claimed identity for a caller that has no title of its own. It
+/// claims Minecraft for Windows; never use it for anything a friend can see.
 pub async fn sisu_identity(
     client: &Client,
     manager: &TokenManager,
 ) -> Result<SisuIdentity, String> {
-    sisu_identity_for(client, manager, XBOX_APP_CLIENT_ID, XBOX_APP_TITLE_ID).await
+    sisu_identity_for(
+        client,
+        manager,
+        MINECRAFT_WIN_CLIENT_ID,
+        MINECRAFT_WIN_TITLE_ID,
+    )
+    .await
 }
 
 /// The same set, but claiming a particular title.

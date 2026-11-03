@@ -7188,6 +7188,7 @@ dependencies = [
  "inquire",
  "msixvc",
  "nix",
+ "p256",
  "reqwest 0.13.4",
  "rustix",
  "serde_json",

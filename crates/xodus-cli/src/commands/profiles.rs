@@ -3,6 +3,10 @@ use std::process::ExitCode;
 use xodus::profiles::{self, Profile};
 use xodus::tokens::{TokenManager, store::TokenStoreError};
 
+/// What a launcher can rely on this client for, read from `account-profiles
+/// --json`. `presence-v1` is the `presence run` and `presence get` protocol.
+pub const CAPABILITIES: &[&str] = &["store-player-accounts", "presence-v1"];
+
 pub fn manager(root: &Path, id: Option<&str>) -> Result<TokenManager, TokenStoreError> {
     match profiles::select(root, id)? {
         Some(id) => TokenManager::for_profile(&id),
@@ -41,10 +45,8 @@ pub fn list(root: &Path, json: bool) -> ExitCode {
             value["signed_in"] = signed_in.into();
             result.push(value);
         }
-        Ok(
-            serde_json::json!({"schema":1,"capabilities":["store-player-accounts"],
-            "default_profile":profiles::default_id(root)?,"profiles":result}),
-        )
+        Ok(serde_json::json!({"schema":1,"capabilities":CAPABILITIES,
+            "default_profile":profiles::default_id(root)?,"profiles":result}))
     })();
     match result {
         Ok(value) => {

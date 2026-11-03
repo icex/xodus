@@ -32,3 +32,6 @@ nix = "0.31.3"
 
 [features]
 tokio_console = ["dep:console-subscriber"]
+
+[dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }

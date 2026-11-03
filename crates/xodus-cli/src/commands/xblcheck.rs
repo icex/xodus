@@ -68,32 +68,37 @@ impl TitleIdentity {
     }
 }
 
+/// Where a game directory keeps its MicrosoftGame.config.
+///
+/// The GDK documents the file as MicrosoftGame.config, but a package is free to
+/// ship any spelling of it and Forza Horizon 5 ships MicrosoftGame.Config. On
+/// the case-sensitive filesystem a Linux install lives on that is a different
+/// file, so look for the documented name and then for whatever the directory
+/// actually holds.
+pub fn game_config_path(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("MicrosoftGame.config");
+    if path.is_file() {
+        return path;
+    }
+    std::fs::read_dir(dir)
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(Result::ok).find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.config"))
+            })
+        })
+        .map_or(path, |e| e.path())
+}
+
 /// Read `TitleId` and optional `MSAAppId` from MicrosoftGame.config.
 ///
 /// The config spells TitleId in hexadecimal and every Xbox endpoint wants it
 /// decimal, which is a conversion worth doing in exactly one place. Legacy
 /// packages omit MSAAppId and use Windows title authentication instead of SISU.
 pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
-    // The GDK documents the file as MicrosoftGame.config, but a package is
-    // free to ship any spelling of it and Forza Horizon 5 ships
-    // MicrosoftGame.Config. On the case-sensitive filesystem a Linux install
-    // lives on that is a different file, so look for the documented name and
-    // then for whatever the directory actually holds.
-    let path = dir.join("MicrosoftGame.config");
-    let path = if path.is_file() {
-        path
-    } else {
-        std::fs::read_dir(dir)
-            .ok()
-            .and_then(|entries| {
-                entries.filter_map(Result::ok).find(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.config"))
-                })
-            })
-            .map_or(path, |e| e.path())
-    };
+    let path = game_config_path(dir);
     let xml =
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let element = |name: &str| -> Option<String> {
