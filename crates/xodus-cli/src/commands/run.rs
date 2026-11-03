@@ -42,7 +42,10 @@ fn make_temp_file(_folder: &str, name: &str) -> std::io::Result<std::fs::File> {
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("xodus");
-    let fd = memfd_create(leaf, MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    // A valid package filename can exceed Linux's 249-byte memfd label limit.
+    // The label is diagnostic only, so use the generic label in that case.
+    let label = if leaf.len() <= 249 { leaf } else { "xodus" };
+    let fd = memfd_create(label, MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
     Ok(std::fs::File::from(fd))
 }
 
