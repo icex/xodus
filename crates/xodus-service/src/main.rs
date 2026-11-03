@@ -91,9 +91,10 @@ async fn main() {
     let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
     let title = title::TitleIdentity::from_env().expect("Invalid title identity binding");
     if entitlement.is_some() && title.is_none() {
-        // An older launcher: the product is bound, the title identity is not.
+        // No released launcher binds a product without the title identity.
+        // The service still starts, but signs no request that claims a title.
         tracing::warn!(
-            "bound to a Store product without XODUS_TITLE_ID; title identities on requests are not pinned"
+            "bound to a Store product without XODUS_TITLE_ID; requests claiming a title will be refused"
         );
     }
     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;

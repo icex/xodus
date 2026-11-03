@@ -570,6 +570,122 @@ fn a_bound_title_cannot_take_the_store_accounts_licensing_audience() {
     assert!(gate(&split, licence).is_ok());
 }
 
+#[test]
+fn the_licensing_hosts_stay_the_licence_paths_whatever_the_endpoint_list_says() {
+    // A list that maps the licence service to an audience of its own, and the
+    // licensing hosts to nothing in particular: the fixed hosts still hold.
+    let moved = EndpointConfig {
+        default: serde_json::from_value(serde_json::json!({
+            "EndPoints": [
+                {"Protocol": "https", "Host": "licensing.mp.microsoft.com", "HostType": "fqdn",
+                 "RelyingParty": "http://licensing.example.test", "SignaturePolicyIndex": 0}
+            ],
+            "SignaturePolicies": [{
+                "Version": 1, "MaxBodyBytes": 8192,
+                "SupportedAlgorithms": ["ES256"], "SupportedSignatureTypes": ["XBL"]
+            }]
+        }))
+        .unwrap(),
+        title: None,
+    };
+    // And no list at all, as when discovery failed in the licence path.
+    let missing = EndpointConfig {
+        default: xodus::models::xbox::TitleMgtResponse {
+            end_points: vec![],
+            signature_policies: vec![],
+        },
+        title: None,
+    };
+    let mut shared = crate::simple_context::tests::context("same-account", "same-account");
+    shared.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+    for endpoints in [&moved, &missing, &licensing_endpoints()] {
+        for audience in [
+            "http://licensing.xboxlive.com",
+            "https://licensing.xboxlive.com/",
+            "HTTP://Licensing.XboxLive.com",
+            "licensing.xboxlive.com",
+            "http://licensing.xboxlive.com./",
+            "http://licensing.xboxlive.com:443/any/path",
+            "https://user@licensing.mp.microsoft.com",
+            "https://licensing.mp.microsoft.com/",
+            "http://collections.mp.microsoft.com",
+            "https://inventory.xboxlive.com/",
+        ] {
+            let message = licensing_audience_gate(&shared, audience, endpoints).unwrap_err();
+            assert!(
+                message.starts_with("refused an XSTS request for the licensing audience"),
+                "{audience}: {message}"
+            );
+        }
+        for audience in [
+            "http://xboxlive.com",
+            "http://mp.microsoft.com/",
+            "https://licensing.xboxlive.com.example.test/",
+            "https://notlicensing.xboxlive.com/",
+            "https://userpresence.xboxlive.com/",
+        ] {
+            assert!(
+                licensing_audience_gate(&shared, audience, endpoints).is_ok(),
+                "{audience}"
+            );
+        }
+    }
+    // The audience the list does map the licence service to is refused too.
+    assert!(licensing_audience_gate(&shared, "http://licensing.example.test/", &moved).is_err());
+
+    // Unbound, or with a Player who is another account, nothing changes.
+    let unbound = crate::simple_context::tests::context("same-account", "same-account");
+    let mut split = crate::simple_context::tests::context("owner-account", "player-account");
+    split.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+    for context in [&unbound, &split] {
+        for audience in [
+            "http://licensing.xboxlive.com",
+            "https://inventory.xboxlive.com/",
+        ] {
+            assert!(
+                licensing_audience_gate(context, audience, &moved).is_ok(),
+                "{audience}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_bound_service_without_the_endpoint_list_refuses_a_titles_request() {
+    let list = || licensing_endpoints().default;
+    let url = "https://title.example.test/v1/thing";
+
+    // Unbound, the audience falls back to the request's host, as before.
+    let unbound = crate::simple_context::tests::context("owner-list", "player-list");
+    for caller in [Caller::Title, Caller::Licensing] {
+        let endpoints = endpoint_config(&unbound, caller, None).unwrap();
+        assert_eq!(endpoints.relying_party(url), "https://title.example.test/");
+    }
+
+    let mut product = crate::simple_context::tests::context("owner-list", "player-list");
+    product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+    let mut titled = crate::simple_context::tests::context("owner-list", "player-list");
+    titled.title = Some(crate::title::TitleIdentity::fixture(
+        1805509784,
+        "own-client",
+    ));
+    for bound in [&product, &titled] {
+        // No list: the title's request is refused, not given a made-up audience.
+        let message = endpoint_config(bound, Caller::Title, None)
+            .err()
+            .expect("a bound service without the list refuses");
+        assert!(message.starts_with("refused an XSTS request"), "{message}");
+        // The licence path names its own fixed URL and still goes ahead.
+        assert!(endpoint_config(bound, Caller::Licensing, None).is_ok());
+        // With the list, the audience comes from it.
+        let endpoints = endpoint_config(bound, Caller::Title, Some(list())).unwrap();
+        assert_eq!(
+            endpoints.relying_party("https://userpresence.xboxlive.com/users/me"),
+            "http://xboxlive.com"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_bound_service_issues_no_msa_tickets_and_an_unbound_one_does() {
     for client in ["own-client", "another-client", ""] {
@@ -618,6 +734,7 @@ async fn a_product_bound_service_refuses_a_chosen_relying_party() {
     let mut product = crate::simple_context::tests::context("owner-xsts", "player-xsts");
     product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
     let mut req = request("https://title.example.test/", "GET", b"");
+    req.title_id = String::new();
     req.relying_party = "http://licensing.xboxlive.com".into();
     let message = xsts_token(&mut product, req)
         .await
@@ -628,12 +745,71 @@ async fn a_product_bound_service_refuses_a_chosen_relying_party() {
         message.starts_with("refused an XSTS request naming its own relying party"),
         "{message}"
     );
-    // The same request without a chosen audience gets past the gate.
-    let req = request("https://title.example.test/", "GET", b"");
+    // The same request without a chosen audience, and claiming no title,
+    // gets past the gate.
+    let mut req = request("https://title.example.test/", "GET", b"");
+    req.title_id = String::new();
     let message = xsts_token(&mut product, req)
         .await
         .err()
         .unwrap()
         .to_string();
     assert_eq!(message, "no signed-in credentials");
+}
+
+#[tokio::test]
+async fn a_product_bound_service_without_a_title_identity_refuses_every_title_claim() {
+    let mut product = crate::simple_context::tests::context("owner-product", "player-product");
+    product.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+    for (title, client) in [
+        ("12345", ""),
+        ("1805509784", "own-client"),
+        ("4294967295", "00000000-0000-0000-0000-00004C26E6C9"),
+    ] {
+        // From the title and from the service's own licence path alike.
+        for caller in [Caller::Title, Caller::Licensing] {
+            let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
+            req.title_id = title.into();
+            req.title_client_id = client.into();
+            let message = xsts_token_for(&mut product, req, caller)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                message.starts_with("refused an XSTS request for title")
+                    && message.contains("without a title identity"),
+                "{title}: {message}"
+            );
+        }
+    }
+    // Claiming no title -- empty, zero or not a number -- is the user and
+    // device only, and gets past the gate.
+    for title in ["", "0", "not-a-title"] {
+        let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
+        req.title_id = title.into();
+        let message = xsts_token(&mut product, req)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(message, "no signed-in credentials", "{title:?}");
+    }
+
+    // With the title identity bound, or with no binding at all, a claim goes
+    // on to the usual checks.
+    let mut titled = crate::simple_context::tests::context("owner-product", "player-product");
+    titled.entitlement = Some(crate::entitlement::Entitlement::fixture("9P5786PJB9RP"));
+    titled.title = Some(crate::title::TitleIdentity::fixture(
+        1805509784,
+        "own-client",
+    ));
+    let mut unbound = crate::simple_context::tests::context("owner-product", "player-product");
+    for context in [&mut titled, &mut unbound] {
+        let mut req = request("https://userpresence.xboxlive.com/users/me", "GET", b"");
+        req.title_id = "1805509784".into();
+        req.title_client_id = "own-client".into();
+        let message = xsts_token(context, req).await.err().unwrap().to_string();
+        assert_eq!(message, "no signed-in credentials");
+    }
 }

@@ -216,7 +216,9 @@ async fn offline_service_fixture() {
         let client = client.clone();
         tokio::spawn(async move {
             let mut magic = [0; 4];
-            if socket.read_exact(&mut magic).await.is_err() { return; }
+            if socket.read_exact(&mut magic).await.is_err() {
+                return;
+            }
             assert_eq!(&magic, b"XSDX");
             let (message, bytes) = super::super::xml::read_request(&mut socket).await.unwrap();
             let message = message as u16;
@@ -496,14 +498,31 @@ async fn an_unbound_service_signs_licence_requests_as_before() {
     assert_eq!(req.title_id, "1298034544");
     assert_eq!(req.title_client_id, "client");
     assert_eq!(req.product_ids.ids, ["9OTHERGAME00"]);
+}
 
-    // A service bound to a product by an older launcher, which passed no
-    // title identity, still scopes the products but keeps the request's title.
-    let mut context = context;
+#[tokio::test]
+async fn a_product_bound_service_without_a_title_identity_refuses_a_titles_licence_request() {
+    // No released launcher binds a product without the title identity, so a
+    // title on the request has nothing to be held to.
+    let mut context = crate::simple_context::tests::context("owner-product", "player-product");
     context.entitlement = Some(crate::entitlement::Entitlement::fixture("9TESTSTORE0I"));
-    let mut req = bound_request(&["9TESTADDON00"], "1298034544", "client");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (title, client) in [("1298034544", "client"), ("1805509784", "")] {
+        let mut req = bound_request(&["9TESTSTORE0I"], title, client);
+        assert_eq!(
+            scope(&context, &mut req, lookup(&calls)).await,
+            Err(
+                "licence token request names a title, and this service has a product binding but no title"
+            ),
+            "{title}"
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // A request naming no title is still held to the product.
+    let mut req = bound_request(&["9TESTSTORE0I"], "", "");
     scope(&context, &mut req, lookup(&calls)).await.unwrap();
-    assert_eq!(req.title_id, "1298034544");
+    let mut req = bound_request(&["9OTHERGAME00"], "0", "");
+    assert!(scope(&context, &mut req, lookup(&calls)).await.is_err());
 }
 
 #[tokio::test]

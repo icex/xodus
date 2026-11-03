@@ -380,13 +380,59 @@ fn bound(context: &SimpleContext) -> bool {
     context.entitlement.is_some() || context.title.is_some()
 }
 
+/// Refuse a title claim in a service bound to a Store product but to no title
+/// identity.
+///
+/// Product binding came with title binding: every launcher that passes
+/// `XODUS_STORE_PRODUCT` passes `XODUS_TITLE_ID` too, empty when the config
+/// names no title. A product alone is therefore not a launch this client
+/// knows, and a claim it cannot check against anything is not signed.
+fn product_only_title_gate(context: &SimpleContext, req: &XSTSTokenRequest) -> Result<(), String> {
+    match (&context.entitlement, &context.title, req.title()) {
+        (Some(product), None, Some(_)) => Err(format!(
+            "refused an XSTS request for title {:?} (client {:?}); this service is bound to the Store product {} without a title identity, so no request may claim a title",
+            req.title_id,
+            req.title_client_id,
+            product.product()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The hosts licence tokens are minted for. The gate below goes by these as
+/// well as by what the endpoint list maps the licence service to: that list is
+/// fetched over the network, and the gate must hold when it maps the licence
+/// service somewhere new, or could not be fetched at all.
+const LICENSING_AUDIENCES: [&str; 4] = [
+    "licensing.xboxlive.com",
+    "licensing.mp.microsoft.com",
+    "collections.mp.microsoft.com",
+    "inventory.xboxlive.com",
+];
+
+/// The host a relying party names: no scheme, user info, port, path or
+/// trailing dot, in lower case. `http://` and `https://` spellings of one host
+/// are the same audience here.
+fn audience_host(relying_party: &str) -> String {
+    let rp = relying_party.trim().to_ascii_lowercase();
+    let rest = rp.split_once("://").map_or(rp.as_str(), |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split(':').next().unwrap_or_default();
+    host.trim_end_matches('.').to_string()
+}
+
 /// Keep the licensing audience to the licence path in a bound service.
 ///
 /// The licence path holds a request to the bound product and its add-ons, but
 /// a title asking for the licensing audience itself could sign a licence
 /// request of its own choosing: the signature covers the method, path and
-/// body, not the host, so any URL resolving to that audience will do. Where
-/// that token would be the Store account's -- one account in both roles -- it
+/// body, not the host, so any URL resolving to that audience will do. That
+/// audience is the one the endpoint list maps the licence service to, and any
+/// of the fixed `LICENSING_AUDIENCES`. Where that token would be the Store
+/// account's -- one account in both roles -- it
 /// is refused. A Player who is another account gets their own licensing
 /// authorization, as on any other machine.
 fn licensing_audience_gate(
@@ -404,15 +450,46 @@ fn licensing_audience_gate(
             .unwrap_or(&rp);
         rp.trim_end_matches('/').to_string()
     };
-    if !bound(context)
-        || audience(relying_party) != audience(&endpoints.relying_party(super::license::URL))
-        || !context.player_is_store_account()
-    {
+    let licensing = LICENSING_AUDIENCES.contains(&audience_host(relying_party).as_str())
+        || audience(relying_party) == audience(&endpoints.relying_party(super::license::URL));
+    if !bound(context) || !licensing || !context.player_is_store_account() {
         return Ok(());
     }
     Err(format!(
         "refused an XSTS request for the licensing audience {relying_party:?}; the Player is the Store account here, and licence tokens come only from licence requests for the bound title"
     ))
+}
+
+/// The endpoint lists a request's audience is resolved against, starting
+/// with the default one.
+///
+/// Without that list the audience would be `https://<host>/` of whatever URL
+/// the request names, outside every mapping the list carries. A bound service
+/// resolves a title's audience from the list only, so it refuses the title's
+/// request until the list can be fetched. The licence path names its own URL,
+/// and an unbound service is unchanged.
+fn endpoint_config(
+    context: &SimpleContext,
+    caller: Caller,
+    default: Option<xodus::models::xbox::TitleMgtResponse>,
+) -> Result<EndpointConfig, String> {
+    let default = match default {
+        Some(default) => default,
+        None if caller == Caller::Title && bound(context) => {
+            return Err(
+                "refused an XSTS request: the endpoint list could not be fetched, and a bound service takes the audience only from it; retry later"
+                    .to_string(),
+            );
+        }
+        None => xodus::models::xbox::TitleMgtResponse {
+            end_points: vec![],
+            signature_policies: vec![],
+        },
+    };
+    Ok(EndpointConfig {
+        default,
+        title: None,
+    })
 }
 
 #[cfg(test)]
@@ -485,8 +562,16 @@ async fn xsts_token_with(
         tracing::warn!("{refusal}");
         return Err(refusal.into());
     }
-    // Bound to a product alone, without a title identity: the audience still
-    // comes from the endpoint list, never from the request.
+    // Bound to a product alone, without a title identity: no released
+    // launcher binds that way, so there is no title a claim could be checked
+    // against. Fail closed: a request claiming a title is refused, whoever
+    // asks, and only the user/device token is left.
+    if let Err(refusal) = product_only_title_gate(context, &req) {
+        tracing::warn!("{refusal}");
+        return Err(refusal.into());
+    }
+    // And the audience still comes from the endpoint list, never from the
+    // request.
     if caller == Caller::Title && bound(context) && !req.relying_party.is_empty() {
         let refusal = format!(
             "refused an XSTS request naming its own relying party {:?}; a bound service resolves it from the endpoint list",
@@ -524,15 +609,10 @@ async fn xsts_token_with(
             .ok_or("invalid title signing key")?,
         None => SIGNER.clone(),
     };
-    let mut endpoints = EndpointConfig {
-        default: endpoints_for(&context.client).await.unwrap_or(
-            xodus::models::xbox::TitleMgtResponse {
-                end_points: vec![],
-                signature_policies: vec![],
-            },
-        ),
-        title: None,
-    };
+    let default = endpoints_for(&context.client).await;
+    let mut endpoints = endpoint_config(context, caller, default).inspect_err(|refusal| {
+        tracing::warn!("{refusal}");
+    })?;
     if let (Some((id, _)), Some(identity)) = (&title, &identity) {
         match title_endpoints_for(&context.client, *id, identity).await {
             Ok(list) => endpoints.title = Some(list),

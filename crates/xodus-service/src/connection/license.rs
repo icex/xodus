@@ -181,6 +181,19 @@ where
         );
         return Err("licence token request is for another title");
     }
+    // Bound to the product but to no title identity, which no released
+    // launcher does: a title on the request could not be held to anything,
+    // and the XSTS request would refuse it anyway. Say so here.
+    if context.title.is_none() && req.title_id.parse::<u32>().is_ok_and(|id| id > 0) {
+        tracing::warn!(
+            "refused a licence token for title {:?}; this service is bound to {} without a title identity",
+            req.title_id,
+            bound.product()
+        );
+        return Err(
+            "licence token request names a title, and this service has a product binding but no title",
+        );
+    }
     if let Err(refusal) = bound.admit_products(&req.product_ids.ids, lookup).await {
         tracing::warn!("{refusal}");
         return Err("licence token request names products outside the bound title");
