@@ -31,6 +31,7 @@ pub async fn route(
         let magic = u32::from_le_bytes(read_magic);
         let res = match magic {
             crate::XML_MAGIC => super::xml::handle(&mut socket, &mut context).await,
+            0x58445343 => super::catalog::handle(&mut socket).await,
             crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
             _ => {
                 tracing::error!("Unknown magic");

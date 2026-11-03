@@ -1,3 +1,4 @@
+mod catalog;
 mod license;
 pub mod proto;
 pub mod router;
