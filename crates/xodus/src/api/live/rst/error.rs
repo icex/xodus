@@ -13,6 +13,19 @@ pub enum RSTError {
     #[error("Error building RST request {0:?}")]
     Builder(#[from] RSTBuilderError),
 
+    #[error("Microsoft rejected the stored device credential")]
+    DeviceCredentialRejected { status: Option<u32> },
+    #[error("Stored device credentials are unavailable")]
+    DeviceCredentialUnavailable,
+    #[error("The device credential could not be renewed; try again or sign in")]
+    DeviceCredentialRefreshFailed,
+    #[error("Stored device signing data is invalid")]
+    InvalidDeviceCredential,
+    #[error("Microsoft returned no device token")]
+    EmptyDeviceTokenResponse,
+    #[error("Microsoft returned an unsupported device-token response")]
+    UnexpectedDeviceTokenResponse,
+
     #[error("Response is malformed, unable to find nonce for decryption")]
     MissingNonce,
     #[error("Unexpected error deriving hmac key")]

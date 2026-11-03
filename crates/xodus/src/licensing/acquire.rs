@@ -10,12 +10,6 @@ pub async fn get_license(
     content_id: String,
     market: String,
 ) -> std::result::Result<(DeviceKey, SPLicense), String> {
-    let dev_token = tokens
-        .get_device_sts_token()
-        .map_err(|_| "Store account device credentials are unavailable")?;
-    let Token::Legacy(dev_token) = dev_token else {
-        return Err("Invalid STS token".to_string());
-    };
     let user = tokens
         .get_user()
         .map_err(|_| "Store account is signed out or changed")?;
@@ -26,9 +20,9 @@ pub async fn get_license(
         return Err("Unspported user token".to_string());
     };
 
-    let ms_device_token = crate::api::live::exchange_device_token(
+    let (ms_device_token, dev_token) = crate::api::live::exchange_device_token_managed(
         client,
-        dev_token.clone(),
+        tokens,
         "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
         "www.microsoft.com".to_owned(),
         Some(soap::PolicyReference::mbi_ssl()),

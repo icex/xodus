@@ -204,12 +204,9 @@ async fn msa_device_ticket(
     tokens: &TokenManager,
     target: &str,
 ) -> Result<String, String> {
-    let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
-        return Err("no usable device token".into());
-    };
-    let issued = xodus::api::live::exchange_device_token(
+    let (issued, _) = xodus::api::live::exchange_device_token_managed(
         client,
-        dev_token,
+        tokens,
         "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
         target.to_owned(),
         Some(soap::PolicyReference::mbi_ssl()),

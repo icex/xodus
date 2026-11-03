@@ -286,18 +286,27 @@ pub(super) async fn read_request<R: tokio::io::AsyncRead + Unpin>(
         kind = 5;
         let size = reader.read_u32_le().await? as usize;
         if size <= u16::MAX as usize || size > MAX_EXTENDED_XSTS {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid extended XSTS size"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid extended XSTS size",
+            ));
         }
         size
     } else {
         if kind & 0x8000 != 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid extended frame"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid extended frame",
+            ));
         }
         short_size as usize
     };
     let mut buffer = vec![0; size];
     reader.read_exact(&mut buffer).await?;
-    Ok((XodusMessageType::try_from(kind as i32).unwrap_or_default(), buffer))
+    Ok((
+        XodusMessageType::try_from(kind as i32).unwrap_or_default(),
+        buffer,
+    ))
 }
 
 pub async fn handle(
@@ -791,18 +800,18 @@ pub async fn parse_message(
             } else {
                 "xboxlive.signin"
             };
-            let device_token = context.device_token.as_ref().unwrap();
-            let device_token_resp = xodus::api::live::exchange_device_token(
-                &context.client,
-                device_token.clone(),
-                "{28C08266-F973-4AE6-FFE4-409B249F138F}".to_string(),
-                "scope=service::user.auth.xboxlive.com::MBI_SSL".to_owned(),
-                Some(soap::PolicyReference::token_broker()),
-            )
-            .await;
+            let (device_token_resp, device_token) =
+                xodus::api::live::exchange_device_token_managed(
+                    &context.client,
+                    &context.tokens(),
+                    "{28C08266-F973-4AE6-FFE4-409B249F138F}".to_string(),
+                    "scope=service::user.auth.xboxlive.com::MBI_SSL".to_owned(),
+                    Some(soap::PolicyReference::token_broker()),
+                )
+                .await?;
 
             let ms_device_rps_token = if let Some((Token::Compact(ms_device_token), Ok(lifetime))) =
-                device_token_resp.ok().map(|t| {
+                Some(device_token_resp).map(|t| {
                     let expiry = chrono::DateTime::parse_from_rfc3339(&t.lifetime.expires);
                     (t.into(), expiry)
                 }) {
@@ -974,21 +983,43 @@ mod framing_tests {
     #[tokio::test]
     async fn preserves_legacy_frames_and_full_extended_body() {
         let payload = b"legacy request";
-        let (kind, result) = decode(5, payload.len() as u16, None, payload).await.unwrap();
+        let (kind, result) = decode(5, payload.len() as u16, None, payload)
+            .await
+            .unwrap();
         assert_eq!(kind, XodusMessageType::XstsTokenRequest);
         assert_eq!(result, payload);
         let payload: Vec<_> = (0..100000).map(|n| (n % 251) as u8).collect();
-        let (kind, result) = decode(0x8005, 0xffff, Some(payload.len() as u32), &payload).await.unwrap();
+        let (kind, result) = decode(0x8005, 0xffff, Some(payload.len() as u32), &payload)
+            .await
+            .unwrap();
         assert_eq!(kind, XodusMessageType::XstsTokenRequest);
         assert_eq!(result, payload);
     }
     #[tokio::test]
     async fn rejects_invalid_or_incomplete_extended_frames() {
         for length in [0, 65535, (MAX_EXTENDED_XSTS + 1) as u32] {
-            assert_eq!(decode(0x8005, 0xffff, Some(length), &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                decode(0x8005, 0xffff, Some(length), &[])
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
         }
-        assert_eq!(decode(0x8005, 2, None, &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(decode(0x8007, 0xffff, None, &[]).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(decode(0x8005, 0xffff, Some(70000), b"truncated").await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            decode(0x8005, 2, None, &[]).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode(0x8007, 0xffff, None, &[]).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            decode(0x8005, 0xffff, Some(70000), b"truncated")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 }

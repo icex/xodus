@@ -97,7 +97,10 @@ pub async fn add(client: &reqwest::Client, root: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    xodus::tokens::device::ensure_device_credentials(client, &tokens).await;
+    if let Err(error) = xodus::tokens::device::ensure_device_credentials(client, &tokens).await {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     let mut pending = Uncommitted {
         tokens: &tokens,
         committed: false,

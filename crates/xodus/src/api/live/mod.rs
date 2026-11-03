@@ -15,8 +15,8 @@ pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 pub async fn login_device_credential(
     client: &reqwest::Client,
     data: DeviceAddRequest,
-) -> reqwest::Result<DeviceAddResponse> {
-    let data = quick_xml::se::to_string(&data).unwrap();
+) -> Result<DeviceAddResponse, rst::RSTError> {
+    let data = quick_xml::se::to_string(&data)?;
 
     let response = client
         .post("https://login.live.com/ppsecure/deviceaddcredential.srf")
@@ -27,7 +27,7 @@ pub async fn login_device_credential(
         .send()
         .await?;
     let text = response.text().await?;
-    let resp: DeviceAddResponse = quick_xml::de::from_str(&text).expect("Failed to de xml");
+    let resp: DeviceAddResponse = quick_xml::de::from_str(&text)?;
     Ok(resp)
 }
 
@@ -52,8 +52,15 @@ pub async fn exchange_device_token(
     scope: String,
     policy: Option<soap::PolicyReference>,
 ) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
-    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().unwrap())?;
-    let secret: [u8; 4096] = secret.try_into().unwrap();
+    let secret = BASE64_STANDARD.decode(
+        token
+            .binary_secret
+            .as_ref()
+            .ok_or(rst::RSTError::InvalidDeviceCredential)?,
+    )?;
+    let secret: [u8; 4096] = secret
+        .try_into()
+        .map_err(|_| rst::RSTError::InvalidDeviceCredential)?;
     let secret: ClepHmacState = transmute!(secret);
     let hmac_secret = secret.get_hmac_state();
 
@@ -70,13 +77,87 @@ pub async fn exchange_device_token(
 
     let envelope = request.request(client).await?;
 
+    device_response(envelope)
+}
+
+fn device_response(
+    envelope: soap::Envelope,
+) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
     match envelope.body.body {
         soap::BodyContent::RequestSecurityTokenResponse(res) => Ok(*res),
-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection) => {
-            let token = collection.security_tokens.remove(0);
-            Ok(token)
+        soap::BodyContent::RequestSecurityTokenResponseCollection(collection) => collection
+            .security_tokens
+            .into_iter()
+            .next()
+            .ok_or(rst::RSTError::EmptyDeviceTokenResponse),
+        soap::BodyContent::Fault(_) => {
+            // Status is a number, never a response body, credential or inline URL.
+            let status = envelope
+                .header
+                .pp
+                .and_then(|pp| pp.req_status)
+                .and_then(|code| {
+                    if let Some(hex) = code.strip_prefix("0x").or_else(|| code.strip_prefix("0X")) {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else {
+                        code.parse::<u32>().ok()
+                    }
+                });
+            Err(rst::RSTError::DeviceCredentialRejected { status })
         }
-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
+        _ => Err(rst::RSTError::UnexpectedDeviceTokenResponse),
+    }
+}
+
+/// Exchange the current shared device credential. A server rejection can precede
+/// its recorded expiry; renew with the existing device key and retry only once.
+pub async fn exchange_device_token_managed(
+    client: &reqwest::Client,
+    tokens: &crate::tokens::TokenManager,
+    hosting_app: String,
+    scope: String,
+    policy: Option<soap::PolicyReference>,
+) -> Result<(soap::RequestSecurityTokenResponse, LegacyToken), rst::RSTError> {
+    with_device_renewal(
+        || async {
+            let Token::Legacy(device) = tokens
+                .get_device_sts_token()
+                .map_err(|_| rst::RSTError::DeviceCredentialUnavailable)?
+            else {
+                return Err(rst::RSTError::InvalidDeviceCredential);
+            };
+            let issued = exchange_device_token(
+                client,
+                device.clone(),
+                hosting_app.clone(),
+                scope.clone(),
+                policy.clone(),
+            )
+            .await?;
+            Ok((issued, device))
+        },
+        || async {
+            crate::tokens::device::refresh_device_credentials(client, tokens)
+                .await
+                .map_err(|_| rst::RSTError::DeviceCredentialRefreshFailed)
+        },
+    )
+    .await
+}
+
+async fn with_device_renewal<T, E, EF, R, RF>(exchange: E, refresh: R) -> Result<T, rst::RSTError>
+where
+    E: Fn() -> EF,
+    EF: std::future::Future<Output = Result<T, rst::RSTError>>,
+    R: Fn() -> RF,
+    RF: std::future::Future<Output = Result<(), rst::RSTError>>,
+{
+    match exchange().await {
+        Err(rst::RSTError::DeviceCredentialRejected { .. }) => {
+            refresh().await?;
+            exchange().await
+        }
+        result => result,
     }
 }
 
@@ -137,12 +218,131 @@ mod test {
     use crate::tokens::TokenManager;
     use crate::tokens::device::ensure_device_credentials;
 
+    #[test]
+    fn device_response_fault_and_empty_collection_are_errors_without_token_data() {
+        use super::{device_response, rst};
+        let mut header = soap::Header::new();
+        header.pp = Some(
+            serde_json::from_value(
+                serde_json::json!({"reqstatus":"0x800488e5","UserSessionKey":"must-not-leak"}),
+            )
+            .unwrap(),
+        );
+        let fault = soap::Envelope::new(
+            header,
+            soap::Body {
+                body: soap::BodyContent::Fault(soap::base::Fault {}),
+            },
+        );
+        let err = device_response(fault).unwrap_err();
+        assert!(matches!(
+            err,
+            rst::RSTError::DeviceCredentialRejected {
+                status: Some(0x800488e5)
+            }
+        ));
+        assert!(!format!("{err:?}").contains("must-not-leak"));
+        let empty = soap::Envelope::new(
+            soap::Header::new(),
+            soap::Body {
+                body: soap::BodyContent::RequestSecurityTokenResponseCollection(
+                    soap::RequestSecurityTokenResponseCollection {
+                        security_tokens: vec![],
+                    },
+                ),
+            },
+        );
+        assert!(matches!(
+            device_response(empty),
+            Err(rst::RSTError::EmptyDeviceTokenResponse)
+        ));
+    }
+    #[tokio::test]
+    async fn device_response_retry_uses_renewed_state_once() {
+        use std::cell::Cell;
+        let renewed = Cell::new(false);
+        let attempts = Cell::new(0);
+        let refreshes = Cell::new(0);
+        let result = super::with_device_renewal(
+            || async {
+                attempts.set(attempts.get() + 1);
+                if renewed.get() {
+                    Ok("fresh-device")
+                } else {
+                    Err(super::rst::RSTError::DeviceCredentialRejected {
+                        status: Some(0x800488e5),
+                    })
+                }
+            },
+            || async {
+                refreshes.set(refreshes.get() + 1);
+                renewed.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "fresh-device");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(refreshes.get(), 1);
+    }
+    #[tokio::test]
+    async fn device_response_rejection_retry_is_bounded() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let refreshes = Cell::new(0);
+        let result = super::with_device_renewal(
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(super::rst::RSTError::DeviceCredentialRejected { status: None })
+            },
+            || async {
+                refreshes.set(refreshes.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(refreshes.get(), 1);
+    }
+    #[tokio::test]
+    async fn device_response_other_failures_do_not_renew_credentials() {
+        let result = super::with_device_renewal(
+            || async { Err::<(), _>(super::rst::RSTError::EmptyDeviceTokenResponse) },
+            || async { panic!("must not renew unrelated failures") },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(super::rst::RSTError::EmptyDeviceTokenResponse)
+        ));
+    }
+    #[tokio::test]
+    async fn device_response_failed_renewal_never_retries_old_credentials() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let result = super::with_device_renewal(
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(super::rst::RSTError::DeviceCredentialRejected { status: None })
+            },
+            || async { Err(super::rst::RSTError::DeviceCredentialRefreshFailed) },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(super::rst::RSTError::DeviceCredentialRefreshFailed)
+        ));
+        assert_eq!(attempts.get(), 1);
+    }
+
     #[tokio::test]
     async fn test_get_xbox_live_dev_token() {
         let client = reqwest::Client::new();
 
         let mgr = TokenManager::with_memory();
-        ensure_device_credentials(&client, &mgr).await;
+        ensure_device_credentials(&client, &mgr).await.unwrap();
 
         let token: Token = mgr.get_device_sts_token().unwrap();
         let Token::Legacy(token) = token else {

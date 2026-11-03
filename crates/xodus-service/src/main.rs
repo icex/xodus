@@ -97,7 +97,12 @@ async fn main() {
             "bound to a Store product without XODUS_TITLE_ID; requests claiming a title will be refused"
         );
     }
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
+    if let Err(error) =
+        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await
+    {
+        tracing::error!("{error}");
+        std::process::exit(1);
+    }
     let xodus::models::secrets::Token::Legacy(device_token) =
         tokens.get_device_sts_token().unwrap()
     else {
