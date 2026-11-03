@@ -539,10 +539,23 @@ where
 
             if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await.unwrap();
-                remote_xvd_ref
+                // A local container is often a *prefix* of the package -- the
+                // streaming install keeps only what it read. Extracting from one
+                // therefore runs off the end partway through, and `early eof`
+                // arriving as a panic reads as a bug in the extractor rather
+                // than as "this container does not go that far".
+                if let Err(err) = remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
                     .await
-                    .expect("msg");
+                {
+                    eprintln!(
+                        "{}: {err}\n  {fpath} does not contain this file. A container left by a \
+                         streaming install holds only the part of the package that was read; \
+                         extracting the whole title needs the package, not the cache.",
+                        job.name
+                    );
+                    return;
+                }
                 tx.send(ProgressEvent::Finished { id }).await.ok();
             } else {
                 remote_xvd_ref
