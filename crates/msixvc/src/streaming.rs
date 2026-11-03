@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, ReadBuf};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -41,6 +41,7 @@ pub struct HttpRead<'t> {
     url: String,
     len: u64,
     pos: u64,
+    transferred: u64,
     pending_open: Option<PendingHttpOpen>,
     active: Option<ActiveHttpStream>,
     pending_chunk: Option<Bytes>,
@@ -71,6 +72,7 @@ impl<'t> HttpRead<'t> {
             url,
             len: initial.len,
             pos: 0,
+            transferred: 0,
             pending_open: None,
             active: Some(ActiveHttpStream {
                 next_offset: initial.start,
@@ -181,8 +183,10 @@ impl<'t> HttpRead<'t> {
         self.pending_chunk_offset += to_copy;
         self.pos += to_copy as u64;
 
+        self.transferred += to_copy as u64;
+        let transferred = self.transferred;
         if let Some(progress) = self.progress.as_mut() {
-            progress(self.pos, self.len);
+            progress(transferred, self.len);
         }
 
         if self.pending_chunk_offset >= chunk.len() {
@@ -191,6 +195,30 @@ impl<'t> HttpRead<'t> {
         }
 
         to_copy
+    }
+}
+
+impl AsyncSeek for HttpRead<'_> {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+        let next = match position {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(n) => self.pos.checked_add_signed(n),
+            SeekFrom::End(n) => self.len.checked_add_signed(n),
+        }
+        .filter(|n| *n <= self.len)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid HTTP seek"))?;
+        if next != self.pos {
+            self.active = None;
+            self.pending_chunk = None;
+            self.pending_chunk_offset = 0;
+            self.empty_resumes = 0;
+            self.pos = next;
+            self.begin_open_stream(next);
+        }
+        Ok(())
+    }
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Poll::Ready(Ok(self.pos))
     }
 }
 
@@ -271,7 +299,9 @@ enum CacheReadState {
 #[derive(Clone, Copy, Debug)]
 enum CacheWriteState {
     Idle,
-    Seeking { offset: u64 },
+    Seeking {
+        offset: u64,
+    },
     Writing,
     /// Written, but not yet visible to the reader. See [`PrefixCacheFile`].
     Flushing,
@@ -316,11 +346,18 @@ where
         len: u64,
         cache_path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<Self> {
-        let cache_path = cache_path.as_ref();
+        Self::open_cache(upstream, len, cache_path.as_ref(), 0).await
+    }
 
+    async fn open_cache(
+        upstream: R,
+        len: u64,
+        cache_path: &std::path::Path,
+        cached_len: u64,
+    ) -> std::io::Result<Self> {
         let cache_writer = OpenOptions::new()
             .create(true)
-            .truncate(true)
+            .truncate(cached_len == 0)
             .read(true)
             .write(true)
             .open(cache_path)
@@ -333,7 +370,7 @@ where
             pos: 0,
             cache_reader,
             cache_writer,
-            cached_len: 0,
+            cached_len,
             unflushed: 0,
             pending_seek: None,
             pending_chunk: None,
@@ -597,7 +634,7 @@ where
 
             match self.as_mut().poll_flush_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {
-                    if self.pending_chunk.is_some() {
+                    if self.pending_chunk.is_some() || self.cached_len >= target_end {
                         continue;
                     }
                 }
@@ -617,6 +654,53 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+impl<R: AsyncRead + AsyncSeek + Unpin> PrefixCacheFile<R> {
+    /// Bind a saved prefix to a fresh copy of the remote header page. Parsing
+    /// must still verify its signature, hash tree and every metadata page.
+    /// A changed package or length starts with an empty cache.
+    pub async fn resumable(
+        mut upstream: R,
+        len: u64,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let probe_len = len.min(4096) as usize;
+        let mut fresh = vec![0; probe_len];
+        upstream.read_exact(&mut fresh).await?;
+        let mut cached_len = 0;
+        if let Ok(mut existing) = File::open(path).await {
+            let size = existing.metadata().await?.len();
+            if size >= probe_len as u64 && size <= len {
+                let mut saved = vec![0; probe_len];
+                if existing.read_exact(&mut saved).await.is_ok() && saved == fresh {
+                    cached_len = size;
+                }
+            }
+        }
+        upstream.seek(SeekFrom::Start(cached_len)).await?;
+        Self::open_cache(upstream, len, path, cached_len).await
+    }
+
+    /// An authenticated metadata check refused saved data. Retry from the
+    /// network once, before any game file is replaced.
+    pub async fn restart(&mut self) -> std::io::Result<()> {
+        self.upstream.seek(SeekFrom::Start(0)).await?;
+        self.cache_writer.set_len(0).await?;
+        self.cache_writer.seek(SeekFrom::Start(0)).await?;
+        self.cache_reader.seek(SeekFrom::Start(0)).await?;
+        self.pos = 0;
+        self.cached_len = 0;
+        self.unflushed = 0;
+        self.pending_seek = None;
+        self.pending_chunk = None;
+        self.pending_chunk_offset = 0;
+        self.cache_read_state = CacheReadState::Idle;
+        self.cache_write_state = CacheWriteState::Idle;
+        self.cache_write_pos = 0;
+        Ok(())
     }
 }
 
@@ -955,6 +1039,103 @@ mod tests {
             .unwrap();
         let len = http.len();
         PrefixCacheFile::new(http, len, cache).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_resume_reuses_saved_prefix_and_ranges_only_the_missing_tail() {
+        let body = test_body();
+        let server = spawn_server(body.clone(), None, 0).await.unwrap();
+        let cache = cache_path("resume-prefix");
+        std::fs::write(&cache, &body[..8192]).unwrap();
+        let count = Arc::new(Mutex::new(0));
+        let observed = count.clone();
+        let http = HttpRead::open(
+            reqwest::Client::new(),
+            &server.url,
+            Some(move |n, _| *observed.lock().unwrap() = n),
+        )
+        .await
+        .unwrap();
+        let mut file = PrefixCacheFile::resumable(http, body.len() as u64, &cache)
+            .await
+            .unwrap();
+        assert_eq!(file.cached_len(), 8192);
+        let mut got = vec![];
+        file.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, body);
+        assert_eq!(*count.lock().unwrap(), 4096 + 8192);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].range.as_deref(), Some("bytes=8192-"));
+        std::fs::remove_file(cache).unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_resume_discards_a_different_package_and_can_restart_corrupt_cache() {
+        let body = test_body();
+        let cache = cache_path("resume-changed");
+        let mut old = body[..8192].to_vec();
+        old[100] ^= 1;
+        std::fs::write(&cache, &old).unwrap();
+        let mut file = PrefixCacheFile::resumable(
+            std::io::Cursor::new(body.clone()),
+            body.len() as u64,
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file.cached_len(), 0);
+        let mut got = vec![];
+        file.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, body);
+        drop(file);
+        // Matching header alone is not validation. The caller checks the
+        // signed hash tree, then restarts once if any saved page is corrupt.
+        let mut bad = body[..8192].to_vec();
+        bad[5000] ^= 1;
+        std::fs::write(&cache, bad).unwrap();
+        let mut file = PrefixCacheFile::resumable(
+            std::io::Cursor::new(body.clone()),
+            body.len() as u64,
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file.cached_len(), 8192);
+        file.restart().await.unwrap();
+        let mut fresh = vec![];
+        file.read_to_end(&mut fresh).await.unwrap();
+        assert_eq!(fresh, body);
+        std::fs::remove_file(cache).unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_resume_revalidates_the_authenticated_tree_before_accepting_cache() {
+        let package = crate::xvd::testing::package();
+        let cache = cache_path("resume-authentication");
+        let mut corrupt = package.bytes.clone();
+        corrupt[package.tree_start + 32] ^= 1;
+        std::fs::write(&cache, corrupt).unwrap();
+        let mut reader = PrefixCacheFile::resumable(
+            std::io::Cursor::new(package.bytes.clone()),
+            package.bytes.len() as u64,
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.cached_len(), package.bytes.len() as u64);
+        assert!(
+            crate::xvd::XvdFile::parse_verified(&mut reader)
+                .await
+                .is_err()
+        );
+        reader.restart().await.unwrap();
+        assert!(
+            crate::xvd::XvdFile::parse_verified(&mut reader)
+                .await
+                .is_ok()
+        );
+        std::fs::remove_file(cache).unwrap();
     }
 
     #[tokio::test]

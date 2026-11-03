@@ -72,6 +72,7 @@ pub async fn run(
     parallel: Option<usize>,
     market: Option<String>,
 ) -> ExitCode {
+    crate::download_session::metadata();
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     let result = if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
@@ -345,7 +346,7 @@ async fn run_cli_reader<Reader>(
     mut rx: Receiver<ProgressEvent>,
 ) -> Result<(), String>
 where
-    Reader: AsyncRead + Unpin,
+    Reader: AsyncRead + AsyncSeek + Unpin,
 {
     let progress = tokio::spawn(async move {
         let multi_progress = MultiProgress::new();
@@ -559,6 +560,43 @@ fn commit(out: &Path, cache_path: &Path, final_path: &Path) -> Result<(), String
         .map_err(|e| format!("could not flush {} to disk: {e}", out.display()))
 }
 
+async fn read_metadata<Reader: AsyncRead + AsyncSeek + Unpin>(
+    remote_file: &mut Reader,
+    trust: &HeaderTrust,
+    try_skip_ntfs: bool,
+    tx: &Sender<ProgressEvent>,
+) -> Result<(XvdFile, HashMap<String, SegmentFile>), String> {
+    let remote_xvd = read_header(&mut *remote_file, trust).await?;
+    let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
+
+    let files = remote_xvd
+        .parse_user_package_files(&mut *remote_file)
+        .await
+        .map_err(stopped("read the package file table"))?;
+    for (k, v) in &files {
+        if k == "SegmentMetadata.bin" {
+            rfiles = remote_xvd
+                .parse_segment_metadata(&mut *remote_file, v)
+                .await
+                .map_err(stopped("read the package segment metadata"))?;
+        }
+    }
+
+    if !try_skip_ntfs || rfiles.is_empty() {
+        tx.send(ProgressEvent::UpdateStatus {
+            name: "Downloading ntfs...".to_owned(),
+        })
+        .await
+        .ok();
+        let sfiles = remote_xvd
+            .parse_ntfs_segment_metadata(&mut *remote_file, !rfiles.is_empty())
+            .await
+            .map_err(stopped("read the package filesystem"))?;
+        rfiles.extend(sfiles);
+    }
+    Ok((remote_xvd, rfiles))
+}
+
 async fn run_reader<Reader>(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -573,7 +611,7 @@ async fn run_reader<Reader>(
     tx: &Sender<ProgressEvent>,
 ) -> Result<(), String>
 where
-    Reader: AsyncRead + Unpin,
+    Reader: AsyncRead + AsyncSeek + Unpin,
 {
     let out: &Path = Path::new(&destination);
 
@@ -592,37 +630,25 @@ where
     }
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
+    let mut remote_file = streaming::PrefixCacheFile::resumable(reader, l, cache_path.clone())
         .await
         .map_err(stopped("open the download cache"))?;
-    let remote_xvd = read_header(&mut remote_file, trust).await?;
-    let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
-
-    let files = remote_xvd
-        .parse_user_package_files(&mut remote_file)
-        .await
-        .map_err(stopped("read the package file table"))?;
-    for (k, v) in &files {
-        if k == "SegmentMetadata.bin" {
-            rfiles = remote_xvd
-                .parse_segment_metadata(&mut remote_file, v)
+    let reused = remote_file.cached_len();
+    if reused > 0 {
+        eprintln!("Validating {reused} bytes of saved package metadata");
+    }
+    let parsed = read_metadata(&mut remote_file, trust, try_skip_ntfs, tx).await;
+    let (remote_xvd, rfiles) = match parsed {
+        Err(_) if reused > 0 => {
+            eprintln!("Saved metadata failed validation; fetching a fresh copy");
+            remote_file
+                .restart()
                 .await
-                .map_err(stopped("read the package segment metadata"))?;
+                .map_err(stopped("reset the metadata cache"))?;
+            read_metadata(&mut remote_file, trust, try_skip_ntfs, tx).await?
         }
-    }
-
-    if !try_skip_ntfs || rfiles.is_empty() {
-        tx.send(ProgressEvent::UpdateStatus {
-            name: "Downloading ntfs...".to_owned(),
-        })
-        .await
-        .ok();
-        let sfiles = remote_xvd
-            .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-            .await
-            .map_err(stopped("read the package filesystem"))?;
-        rfiles.extend(sfiles);
-    }
+        result => result?,
+    };
     // The cache has everything it is going to get; the rest comes from the
     // files' own ranges.
     drop(remote_file);

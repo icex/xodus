@@ -12,6 +12,17 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// The preparation phase has no game-download total yet. Sequence zero lets
+/// the first planned-transfer event (sequence one) take over the same stream.
+pub fn metadata() {
+    if std::env::var("XODUS_PROGRESS").is_ok_and(|value| value == "json") {
+        println!(
+            "FERESTRE_PROGRESS {}",
+            serde_json::json!({"schema":1,"event":"progress","sequence":0,"phase":"metadata","completedBytes":0,"totalBytes":null,"paused":false,"canPause":false})
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct Session(Arc<Shared>);
 struct Shared {
