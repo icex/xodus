@@ -60,12 +60,15 @@ pub(crate) async fn title_claim_xsts(
     relying_party: &str,
 ) -> Result<XstsResponse, String> {
     let id = xodus::auth::sisu_identity_for(client, tokens, client_id, title_id).await?;
+    let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&id.key_pkcs8)
+        .ok_or("invalid title signing key")?;
     xodus::api::xbox::request_xsts_token(
         client,
         id.user_token,
         Some(id.device_token),
         Some(id.title_token),
         relying_party,
+        Some(&signer),
     )
     .await
     .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))

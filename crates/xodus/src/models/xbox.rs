@@ -34,7 +34,7 @@ pub struct XstsResponse {
 struct DisplayClaims {
     #[serde(default)]
     xui: Vec<XuiClaim>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_title_claims")]
     xti: Vec<XtiClaim>,
 }
 
@@ -50,6 +50,60 @@ struct XuiClaim {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct XtiClaim {
     tid: Option<String>,
+}
+
+fn deserialize_title_claims<'de, D>(deserializer: D) -> Result<Vec<XtiClaim>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // title/authenticate returns one object; xsts/authorize returns an array.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TitleClaims {
+        Single(XtiClaim),
+        Multiple(Vec<XtiClaim>),
+    }
+
+    match TitleClaims::deserialize(deserializer)? {
+        TitleClaims::Single(claim) => Ok(vec![claim]),
+        TitleClaims::Multiple(claims) => Ok(claims),
+    }
+}
+
+#[cfg(test)]
+mod title_claim_tests {
+    use super::*;
+
+    #[test]
+    fn title_claim_accepts_authentication_object_and_xsts_array() {
+        for xti in [
+            serde_json::json!({"tid": "305419896"}),
+            serde_json::json!([{"tid": "305419896"}]),
+        ] {
+            let response: XstsResponse = serde_json::from_value(serde_json::json!({
+                "NotAfter": "2030-01-01T00:00:00Z",
+                "Token": "synthetic-token",
+                "DisplayClaims": {"xti": xti}
+            }))
+            .expect("title claim shape is supported");
+            assert_eq!(response.display_claims.xti.len(), 1);
+            assert_eq!(
+                response.display_claims.xti[0].tid.as_deref(),
+                Some("305419896")
+            );
+        }
+    }
+
+    #[test]
+    fn title_claim_remains_optional_for_user_and_device_tokens() {
+        let response: XstsResponse = serde_json::from_value(serde_json::json!({
+            "NotAfter": "2030-01-01T00:00:00Z",
+            "Token": "synthetic-token",
+            "DisplayClaims": {}
+        }))
+        .expect("title claim is optional");
+        assert!(response.display_claims.xti.is_empty());
+    }
 }
 
 impl XstsResponse {
@@ -119,6 +173,7 @@ pub struct XstsRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct TitleMgtResponse {
     pub end_points: Vec<TitleMgtEndPoint>,
+    #[serde(default)]
     pub signature_policies: Vec<TitleMgtSignaturePolicy>,
 }
 
@@ -129,6 +184,8 @@ pub struct TitleMgtEndPoint {
     pub host: String,
     #[serde(default)]
     pub host_type: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub relying_party: Option<String>,
     #[serde(default)]

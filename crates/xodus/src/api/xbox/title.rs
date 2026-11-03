@@ -1,3 +1,4 @@
+use crate::api::xbox::signing::RequestSigner;
 use crate::models::xbox::{TitleMgtEndPoint, TitleMgtResponse};
 
 pub async fn get_title_management(client: &reqwest::Client) -> reqwest::Result<TitleMgtResponse> {
@@ -8,25 +9,132 @@ pub async fn get_title_management(client: &reqwest::Client) -> reqwest::Result<T
     response.json().await
 }
 
-pub fn get_endpoint<'a>(url: &str, response: &'a TitleMgtResponse) -> Option<&'a TitleMgtEndPoint> {
-    let parsed_url = reqwest::Url::parse(url).ok()?;
-    let filtered: Vec<&TitleMgtEndPoint> = response
-        .end_points
-        .iter()
-        .filter(|e| e.protocol == parsed_url.scheme())
-        .collect();
-    let hosts: Vec<globset::Glob> = filtered
-        .iter()
-        .map(|e| globset::Glob::new(&e.host).expect("Unsupported glob"))
-        .collect();
-    let set = globset::GlobSet::new(hosts).ok()?;
-    let matched = set.matches(parsed_url.host_str().unwrap());
-    let matched: Vec<&TitleMgtEndPoint> = matched.into_iter().map(|m| filtered[m]).collect();
+/// Fetch endpoints for the title identified by the supplied authorization.
+/// The authorization and signature must come from the same proof key.
+/// Keep this response separate from the default list: policy indices are local.
+pub async fn get_title_endpoints(
+    client: &reqwest::Client,
+    authorization: &str,
+    signer: &RequestSigner,
+) -> reqwest::Result<TitleMgtResponse> {
+    let signature = signer.sign(
+        1,
+        "GET",
+        "/titles/current/endpoints",
+        authorization,
+        &[],
+        8192,
+    );
+    client
+        .get("https://title.mgt.xboxlive.com/titles/current/endpoints")
+        .header("Authorization", authorization)
+        .header("Signature", signature)
+        .header("x-xbl-contract-version", "1")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+}
 
-    matched
-        .iter()
-        .max_by_key(|&&pat| pat.host.chars().filter(|&c| c != '*').count())
-        .copied()
+// Host specificity wins first; an exact host breaks a wildcard tie, and a
+// matching path restriction wins over the same host's unrestricted entry.
+fn endpoint_specificity(
+    url: &reqwest::Url,
+    endpoint: &TitleMgtEndPoint,
+    suffix_only: bool,
+) -> Option<(usize, bool, usize)> {
+    // WebSocket authentication uses the HTTP Upgrade request's protocol,
+    // as in xal-rs SignaturePolicyCache's policy and relying-party lookups.
+    let protocol = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        scheme => scheme,
+    };
+    if !endpoint.protocol.eq_ignore_ascii_case(protocol) {
+        return None;
+    }
+    let host = url.host_str()?;
+    let pattern = endpoint.host.to_ascii_lowercase();
+    let matcher = globset::GlobBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()?
+        .compile_matcher();
+    // Some default entries name a service's parent domain without a glob.
+    // Keep the service's subdomains, but never a lookalike suffix.
+    let suffix = !pattern.contains(['*', '?', '[', '{', '\\'])
+        && host
+            .strip_suffix(&pattern)
+            .is_some_and(|prefix| prefix.ends_with('.'));
+    let matches_host = if suffix_only {
+        suffix
+    } else {
+        matcher.is_match(host)
+    };
+    if !matches_host {
+        return None;
+    }
+    let path = endpoint.path.as_deref().unwrap_or("");
+    if !path.is_empty() && url.path() != path {
+        let rest = url.path().strip_prefix(path)?;
+        if !path.ends_with('/') && !rest.starts_with('/') {
+            return None;
+        }
+    }
+    Some((
+        pattern.chars().filter(|c| !matches!(c, '*' | '?')).count(),
+        host.eq_ignore_ascii_case(&pattern),
+        path.len(),
+    ))
+}
+
+pub fn get_endpoint<'a>(url: &str, response: &'a TitleMgtResponse) -> Option<&'a TitleMgtEndPoint> {
+    let url = reqwest::Url::parse(url).ok()?;
+    select_endpoint(&url, response, None, false).map(|(endpoint, _)| endpoint)
+}
+
+fn select_endpoint<'a>(
+    url: &reqwest::Url,
+    default: &'a TitleMgtResponse,
+    title: Option<&'a TitleMgtResponse>,
+    suffix_only: bool,
+) -> Option<(&'a TitleMgtEndPoint, &'a TitleMgtResponse)> {
+    [Some(default), title]
+        .into_iter()
+        .flatten()
+        .flat_map(|source| {
+            source
+                .end_points
+                .iter()
+                .map(move |endpoint| (endpoint, source))
+        })
+        .filter(|(endpoint, _)| !suffix_only || endpoint.relying_party.is_some())
+        .filter_map(|(endpoint, source)| {
+            endpoint_specificity(url, endpoint, suffix_only)
+                .map(|specificity| (specificity, endpoint, source))
+        })
+        .max_by_key(|(specificity, _, _)| *specificity)
+        .map(|(_, endpoint, source)| (endpoint, source))
+}
+
+/// Select the most specific matching host/path across both endpoint lists.
+/// Equal rules prefer the current title. Return the source list alongside the
+/// endpoint so its SignaturePolicyIndex cannot address another list's policy.
+/// If no matching rule supplies an RP, try bare service domains as suffixes,
+/// retaining dot boundaries. That compatibility fallback never replaces an
+/// explicitly matched RP, including one selected by a wildcard.
+pub fn get_endpoint_with_title<'a>(
+    url: &str,
+    default: &'a TitleMgtResponse,
+    title: Option<&'a TitleMgtResponse>,
+) -> Option<(&'a TitleMgtEndPoint, &'a TitleMgtResponse)> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let endpoint = select_endpoint(&url, default, title, false);
+    if endpoint.is_some_and(|(entry, _)| entry.relying_party.is_some()) {
+        return endpoint;
+    }
+    select_endpoint(&url, default, title, true).or(endpoint)
 }
 
 #[cfg(test)]
@@ -56,5 +164,286 @@ mod test {
             updates.relying_party.as_deref(),
             Some("http://update.xboxlive.com")
         );
+    }
+}
+
+#[cfg(test)]
+mod nsal_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn response(endpoints: serde_json::Value, max_body_bytes: u64) -> TitleMgtResponse {
+        serde_json::from_value(json!({
+            "EndPoints": endpoints,
+            "SignaturePolicies": [{
+                "Version": 1,
+                "SupportedAlgorithms": ["ES256"],
+                "MaxBodyBytes": max_body_bytes,
+                "SupportedSignatureTypes": ["XBL"]
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn websocket_schemes_use_only_the_matching_http_security_level() {
+        for (websocket, http, other_websocket) in [("wss", "https", "ws"), ("ws", "http", "wss")] {
+            let list = response(
+                json!([{
+                    "Protocol": http, "Host": "stream.example.test",
+                    "RelyingParty": "rp://stream", "SignaturePolicyIndex": 0
+                }]),
+                8192,
+            );
+            for scheme in [websocket, http] {
+                let endpoint = get_endpoint(
+                    &format!("{scheme}://stream.example.test/connect?version=1"),
+                    &list,
+                )
+                .expect("WebSocket handshake uses its HTTP endpoint policy");
+                assert_eq!(endpoint.relying_party.as_deref(), Some("rp://stream"));
+                assert_eq!(endpoint.signature_policy_index, Some(0));
+            }
+            assert!(
+                get_endpoint(
+                    &format!("{other_websocket}://stream.example.test/connect"),
+                    &list
+                )
+                .is_none(),
+                "secure and plain WebSockets must not share policies"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_title_routes_preserve_path_boundaries_and_ignore_query_for_selection() {
+        for (websocket, http) in [("wss", "https"), ("ws", "http")] {
+            let default = response(
+                json!([{
+                    "Protocol": http, "Host": "*.example.test",
+                    "RelyingParty": "rp://default", "SignaturePolicyIndex": 0
+                }]),
+                8192,
+            );
+            let title = response(
+                json!([{
+                    "Protocol": http, "Host": "stream.example.test", "Path": "/events",
+                    "RelyingParty": "rp://events", "SignaturePolicyIndex": 0
+                }]),
+                123,
+            );
+            for (path, rp, max_bytes) in [
+                ("/events?version=1", "rp://events", 123),
+                ("/events/new?version=2", "rp://events", 123),
+                ("/eventstream?next=/events", "rp://default", 8192),
+                ("/other?next=/events", "rp://default", 8192),
+            ] {
+                let (endpoint, source) = get_endpoint_with_title(
+                    &format!("{websocket}://stream.example.test{path}"),
+                    &default,
+                    Some(&title),
+                )
+                .expect("WebSocket endpoint rule");
+                assert_eq!(endpoint.relying_party.as_deref(), Some(rp), "{path}");
+                assert_eq!(
+                    source.signature_policies[endpoint.signature_policy_index.unwrap() as usize]
+                        .max_body_bytes,
+                    max_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_title_nsal_can_omit_signature_policies() {
+        let title: TitleMgtResponse = serde_json::from_value(json!({
+            "EndPoints": [{"Protocol": "https", "Host": "*.race.example.test",
+                "RelyingParty": "https://race.example.test/"}]
+        }))
+        .unwrap();
+        assert!(title.signature_policies.is_empty());
+        assert_eq!(
+            get_endpoint("https://api.race.example.test/player", &title)
+                .unwrap()
+                .relying_party
+                .as_deref(),
+            Some("https://race.example.test/")
+        );
+    }
+
+    #[test]
+    fn path_routes_do_not_capture_other_paths_on_the_same_host() {
+        let list = response(
+            json!([
+                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://general"},
+                {"Protocol": "https", "Host": "api.example.test", "Path": "/private",
+                 "RelyingParty": "rp://private"}
+            ]),
+            8192,
+        );
+        for (path, expected) in [
+            ("/public", "rp://general"),
+            ("/privately", "rp://general"),
+            ("/private", "rp://private"),
+            ("/private/player?x=1", "rp://private"),
+        ] {
+            assert_eq!(
+                get_endpoint(&format!("https://api.example.test{path}"), &list)
+                    .unwrap()
+                    .relying_party
+                    .as_deref(),
+                Some(expected),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_host_globs_do_not_panic_or_hide_valid_entries() {
+        let list = response(
+            json!([
+                {"Protocol": "https", "Host": "[invalid", "RelyingParty": "rp://invalid"},
+                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://valid"}
+            ]),
+            8192,
+        );
+        assert_eq!(
+            get_endpoint("https://api.example.test/", &list)
+                .unwrap()
+                .relying_party
+                .as_deref(),
+            Some("rp://valid")
+        );
+        assert!(get_endpoint("data:text/plain,no-host", &list).is_none());
+    }
+
+    #[test]
+    fn title_service_rp_and_signature_policy_keep_their_own_source() {
+        let default = response(
+            json!([
+                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://public",
+                 "SignaturePolicyIndex": 0}
+            ]),
+            8192,
+        );
+        let title = response(
+            json!([
+                {"Protocol": "https", "Host": "*.race.example.test", "RelyingParty": "rp://race",
+                 "SignaturePolicyIndex": 0}
+            ]),
+            123,
+        );
+        for (url, rp, max_bytes) in [
+            ("https://api.race.example.test/player", "rp://race", 123),
+            ("https://public.example.test/player", "rp://public", 8192),
+        ] {
+            let (endpoint, source) = get_endpoint_with_title(url, &default, Some(&title)).unwrap();
+            assert_eq!(endpoint.relying_party.as_deref(), Some(rp));
+            assert_eq!(
+                source.signature_policies[endpoint.signature_policy_index.unwrap() as usize]
+                    .max_body_bytes,
+                max_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn equal_title_rules_override_default_without_overriding_more_specific_hosts() {
+        let default = response(
+            json!([
+                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://default"},
+                {"Protocol": "https", "Host": "profile.example.test", "RelyingParty": "rp://profile"}
+            ]),
+            8192,
+        );
+        let title = response(
+            json!([
+                {"Protocol": "https", "Host": "*", "RelyingParty": "rp://catchall"},
+                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://title"}
+            ]),
+            8192,
+        );
+        for (url, rp) in [
+            ("https://api.example.test/", "rp://title"),
+            ("https://profile.example.test/", "rp://profile"),
+        ] {
+            assert_eq!(
+                get_endpoint_with_title(url, &default, Some(&title))
+                    .unwrap()
+                    .0
+                    .relying_party
+                    .as_deref(),
+                Some(rp)
+            );
+        }
+    }
+
+    #[test]
+    fn title_configurations_are_isolated_even_when_hosts_match() {
+        let default = response(json!([]), 8192);
+        let one = response(
+            json!([
+                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://one"}
+            ]),
+            8192,
+        );
+        let two = response(
+            json!([
+                {"Protocol": "https", "Host": "api.example.test", "RelyingParty": "rp://two"}
+            ]),
+            8192,
+        );
+        for (title, rp) in [(&one, "rp://one"), (&two, "rp://two"), (&one, "rp://one")] {
+            assert_eq!(
+                get_endpoint_with_title("https://api.example.test/", &default, Some(title))
+                    .unwrap()
+                    .0
+                    .relying_party
+                    .as_deref(),
+                Some(rp)
+            );
+        }
+        assert!(get_endpoint_with_title("https://api.example.test/", &default, None).is_none());
+    }
+
+    #[test]
+    fn bare_domain_fallback_beats_an_empty_title_catchall_without_matching_lookalikes() {
+        let default = response(
+            json!([
+                {"Protocol": "https", "Host": "backend.example.test", "RelyingParty": "rp://backend"}
+            ]),
+            8192,
+        );
+        let title = response(json!([{"Protocol": "https", "Host": "*"}]), 8192);
+        let (endpoint, _) = get_endpoint_with_title(
+            "https://api.site.backend.example.test/",
+            &default,
+            Some(&title),
+        )
+        .unwrap();
+        assert_eq!(endpoint.relying_party.as_deref(), Some("rp://backend"));
+        for host in ["evilbackend.example.test", "backend.example.test.evil.test"] {
+            assert!(
+                get_endpoint_with_title(&format!("https://{host}/"), &default, Some(&title))
+                    .unwrap()
+                    .0
+                    .relying_party
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_domain_suffix_does_not_override_a_matching_wildcard_rp() {
+        let default = response(
+            json!([
+                {"Protocol": "https", "Host": "*.example.test", "RelyingParty": "rp://explicit"},
+                {"Protocol": "https", "Host": "service.example.test", "RelyingParty": "rp://suffix"}
+            ]),
+            8192,
+        );
+        let (endpoint, _) =
+            get_endpoint_with_title("https://api.service.example.test/", &default, None).unwrap();
+        assert_eq!(endpoint.relying_party.as_deref(), Some("rp://explicit"));
     }
 }

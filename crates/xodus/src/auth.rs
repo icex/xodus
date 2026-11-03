@@ -150,7 +150,11 @@ pub async fn do_sisu(
             tracing::warn!("Failed to persist refreshed STS token: {err}");
         }
     }
-    let token: soap::RequestSecurityTokenResponse = collection.security_tokens.remove(0);
+    let token = collection
+        .security_tokens
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other("MSA returned no user token for SISU"))?;
     let token: Token = token.into();
     let Token::Compact(user_token) = token else {
         return Err(Box::new(std::io::Error::new(
@@ -181,8 +185,7 @@ pub async fn do_sisu(
         .await?;
     let resp = auth
         .sisu_authorize_rps(&user_token, &data.token, None)
-        .await
-        .expect("ok");
+        .await?;
     Ok((auth, resp, data))
 }
 
@@ -205,16 +208,131 @@ async fn test_minecraft_win_auth() {
 /// Everything a title needs to authenticate, all bound to one signing key.
 ///
 /// Xbox refuses to mix keys: a title token minted under one key and a user
-/// token minted under another makes xsts/authorize answer 400, and
-/// title/authenticate will not issue a title token to this path's own ticket
-/// at all (403). SISU issues device, title and user tokens together under a
-/// single key, so the way to get a title claim is to take that whole set --
-/// and its key, which then has to sign our requests too.
+/// token minted under another makes xsts/authorize answer 400. Both SISU and
+/// the Windows title authentication flow return this complete set, including
+/// the key that must also sign subsequent service requests.
 pub struct SisuIdentity {
     pub key_pkcs8: Vec<u8>,
     pub device_token: String,
     pub title_token: String,
     pub user_token: String,
+    /// Earliest token expiry, expressed as a Unix timestamp.
+    pub expires_at: i64,
+}
+
+/// Authenticate a Windows title whose metadata provides a TitleId.
+///
+/// Uses the signed-in account's legacy credentials for the user exchange and
+/// binds the user, device and title tokens to one newly generated signing key.
+/// Unlike SISU, the Windows title exchange does not require an MSAAppId.
+pub async fn win32_identity_for(
+    client: &Client,
+    manager: &TokenManager,
+    title_id: i64,
+) -> Result<SisuIdentity, String> {
+    use crate::api::xbox::{
+        RequestSigner, authenticate_xbox_device, authenticate_xbox_title_win,
+        authenticate_xbox_user,
+    };
+
+    if !(1..=u32::MAX as i64).contains(&title_id) {
+        return Err(
+            "Windows title authentication requires a TitleId in 1..=4294967295".to_string(),
+        );
+    }
+    let Token::Legacy(user_sts) = manager
+        .get_user_sts_token()
+        .map_err(|e| format!("could not load the signed-in user's STS token: {e}"))?
+    else {
+        return Err("Windows title authentication requires a legacy user STS token".to_string());
+    };
+    let Token::Legacy(device_sts) = manager
+        .get_device_sts_token()
+        .map_err(|e| format!("could not load the device STS token: {e}"))?
+    else {
+        return Err("Windows title authentication requires a legacy device STS token".to_string());
+    };
+
+    let outcome = crate::api::live::exchange_user_token(
+        client,
+        user_sts,
+        "USERNAME".to_string(),
+        device_sts,
+        None,
+        Some("Silent".to_string()),
+        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+        &[(
+            "user.auth.xboxlive.com".to_owned(),
+            Some(soap::PolicyReference::mbi_ssl()),
+        )],
+    )
+    .await
+    .map_err(|e| format!("MSA user token exchange failed: {e}"))?;
+
+    let user_ticket: Token = match outcome {
+        ExchangeUserTokenOutcome::Fault(_) => return Err("MSA returned a fault".to_string()),
+        ExchangeUserTokenOutcome::Issued(
+            soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
+        ) => {
+            if collection.security_tokens.is_empty() {
+                return Err("MSA returned no tokens".to_string());
+            }
+            collection.security_tokens.remove(0).into()
+        }
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(t)) => {
+            (*t).into()
+        }
+        _ => return Err("unexpected MSA response".to_string()),
+    };
+    let Token::Compact(user_ticket) = user_ticket else {
+        return Err("unsupported MSA token form".to_string());
+    };
+
+    let signer = RequestSigner::generate();
+    let key_pkcs8 = signer
+        .to_pkcs8()
+        .ok_or_else(|| "could not export the Windows signing key".to_string())?;
+    let user = authenticate_xbox_user(client, user_ticket, Some(&signer))
+        .await
+        .map_err(|e| format!("Xbox user authentication failed: {e}"))?;
+    let device = authenticate_xbox_device(client, &signer)
+        .await
+        .map_err(|e| format!("Xbox device authentication failed: {e}"))?;
+    let title =
+        authenticate_xbox_title_win(client, device.token.clone(), title_id, &signer).await?;
+
+    Ok(SisuIdentity {
+        key_pkcs8,
+        expires_at: user
+            .not_after
+            .timestamp()
+            .min(device.not_after.timestamp())
+            .min(title.not_after.timestamp()),
+        device_token: device.token,
+        title_token: title.token,
+        user_token: user.token,
+    })
+}
+
+#[cfg(test)]
+mod win32_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn win32_identity_rejects_invalid_title_id_before_loading_credentials() {
+        let client = Client::new();
+        let manager = TokenManager::with_memory();
+        for title_id in [4294967296, 0, -1, i64::MIN, i64::MAX] {
+            let error = win32_identity_for(&client, &manager, title_id)
+                .await
+                .err()
+                .expect("invalid title ID must fail");
+            assert_eq!(
+                error,
+                "Windows title authentication requires a TitleId in 1..=4294967295"
+            );
+        }
+    }
 }
 
 /// The Xbox app's own identity: a title claim, but for the Xbox app rather than
@@ -258,6 +376,12 @@ pub async fn sisu_identity_for(
 
     Ok(SisuIdentity {
         key_pkcs8,
+        expires_at: resp
+            .user_token
+            .not_after
+            .timestamp()
+            .min(device.not_after.timestamp())
+            .min(resp.title_token.not_after.timestamp()),
         device_token: device.token,
         title_token: resp.title_token.token,
         user_token: resp.user_token.token,

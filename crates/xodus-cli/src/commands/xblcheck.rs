@@ -62,16 +62,17 @@ impl TitleIdentity {
     /// The service config id a title's sessions live under. Titles are free to
     /// use another, but the convention -- and what the probe needs in order to
     /// address *something* of this title's -- is the title id in the last
-    /// twelve digits.
+    /// eight hexadecimal digits.
     fn scid(&self) -> String {
         format!("00000000-0000-0000-0000-0000{:08x}", self.title_id)
     }
 }
 
-/// Read `TitleId` and `MSAAppId` out of a game directory's MicrosoftGame.config.
+/// Read `TitleId` and optional `MSAAppId` from MicrosoftGame.config.
 ///
 /// The config spells TitleId in hexadecimal and every Xbox endpoint wants it
-/// decimal, which is a conversion worth doing in exactly one place.
+/// decimal, which is a conversion worth doing in exactly one place. Legacy
+/// packages omit MSAAppId and use Windows title authentication instead of SISU.
 pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
     // The GDK documents the file as MicrosoftGame.config, but a package is
     // free to ship any spelling of it and Forza Horizon 5 ships
@@ -102,14 +103,43 @@ pub fn identity_from_game_dir(dir: &Path) -> Result<TitleIdentity, String> {
         Some(xml[start..start + len].trim().to_string())
     };
     let hex = element("TitleId").ok_or_else(|| format!("{} has no <TitleId>", path.display()))?;
-    let title_id = i64::from_str_radix(hex.trim_start_matches("0x"), 16)
-        .map_err(|_| format!("<TitleId>{hex}</TitleId> is not hexadecimal"))?;
-    let client_id =
-        element("MSAAppId").ok_or_else(|| format!("{} has no <MSAAppId>", path.display()))?;
+    let title_id = u32::from_str_radix(hex.trim_start_matches("0x"), 16)
+        .ok()
+        .filter(|id| *id != 0)
+        .map(i64::from)
+        .ok_or_else(|| {
+            format!("<TitleId>{hex}</TitleId> must be a nonzero 32-bit hexadecimal integer")
+        })?;
+    let client_id = element("MSAAppId").unwrap_or_default();
     Ok(TitleIdentity {
         title_id,
         client_id,
     })
+}
+
+async fn title_claim_xsts(
+    client: &reqwest::Client,
+    tokens: &TokenManager,
+    identity: &TitleIdentity,
+) -> Result<xodus::models::xbox::XstsResponse, String> {
+    let claim = if identity.client_id.is_empty() {
+        xodus::auth::win32_identity_for(client, tokens, identity.title_id).await?
+    } else {
+        xodus::auth::sisu_identity_for(client, tokens, &identity.client_id, identity.title_id)
+            .await?
+    };
+    let signer = xodus::api::xbox::RequestSigner::from_pkcs8(&claim.key_pkcs8)
+        .ok_or("invalid title signing key")?;
+    xodus::api::xbox::request_xsts_token(
+        client,
+        claim.user_token,
+        Some(claim.device_token),
+        Some(claim.title_token),
+        "http://xboxlive.com",
+        Some(&signer),
+    )
+    .await
+    .map_err(|e| format!("xsts/authorize refused the title claim: {e}"))
 }
 
 async fn run_probe(
@@ -140,10 +170,17 @@ pub async fn run(
     tokens: &TokenManager,
     identity: TitleIdentity,
 ) -> ExitCode {
-    println!(
-        ":: title {} (client id {})",
-        identity.title_id, identity.client_id
-    );
+    if identity.client_id.is_empty() {
+        println!(
+            ":: title {} (Windows title authentication)",
+            identity.title_id
+        );
+    } else {
+        println!(
+            ":: title {} (SISU client id {})",
+            identity.title_id, identity.client_id
+        );
+    }
 
     let plain = match super::collections::xsts_for(client, tokens, "http://xboxlive.com").await {
         Ok(xsts) => xsts,
@@ -180,14 +217,7 @@ pub async fn run(
 
     // The claim itself. A failure here is the interesting one, and it is the
     // failure a title reports as "failed to create party".
-    let claimed = super::collections::title_claim_xsts(
-        client,
-        tokens,
-        &identity.client_id,
-        identity.title_id,
-        "http://xboxlive.com",
-    )
-    .await;
+    let claimed = title_claim_xsts(client, tokens, &identity).await;
     let claimed_auth = match claimed {
         Ok(xsts) => xodus::api::xbox::get_xsts_auth_header(xsts),
         Err(message) => {
@@ -225,13 +255,13 @@ pub async fn run(
         if plain_status.is_success() {
             println!(
                 "         the same call succeeds with no title claim, so the claim is being \
-                 refused -- check that MSAAppId and TitleId match the running title"
+                 refused -- check TitleId and MSAAppId (when present) against the running title"
             );
         }
     }
 
     if failed == 0 {
-        println!(":: Xbox Live is fully authorised for this title");
+        println!(":: all Xbox Live diagnostic probes passed for this title");
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -289,14 +319,46 @@ mod tests {
     }
 
     #[test]
-    fn a_config_missing_the_app_id_says_which_one_is_missing() {
+    fn a_legacy_config_without_an_app_id_keeps_its_title_and_scid() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("MicrosoftGame.config"),
-            "<Game><TitleId>69C7AA31</TitleId></Game>",
+            r#"<Game configVersion="0"><TitleId>10203040</TitleId></Game>"#,
         )
         .expect("write");
-        let err = identity_from_game_dir(dir.path()).expect_err("no MSAAppId");
-        assert!(err.contains("MSAAppId"), "{err}");
+        let id = identity_from_game_dir(dir.path()).expect("legacy title identity");
+        assert_eq!(id.title_id, 0x1020_3040);
+        assert!(id.client_id.is_empty(), "no SISU client ID is available");
+        assert_eq!(id.scid(), "00000000-0000-0000-0000-000010203040");
+    }
+
+    #[test]
+    fn an_empty_app_id_also_selects_the_legacy_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("MicrosoftGame.config"),
+            "<Game><TitleId>FFFFFFFF</TitleId><MSAAppId> </MSAAppId></Game>",
+        )
+        .expect("write");
+        let id = identity_from_game_dir(dir.path()).expect("empty app ID");
+        assert_eq!(id.title_id, u32::MAX as i64);
+        assert!(id.client_id.is_empty());
+        assert_eq!(id.scid(), "00000000-0000-0000-0000-0000ffffffff");
+    }
+
+    #[test]
+    fn invalid_title_ids_are_rejected_before_authentication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for title_id in ["0", "-1", "100000000", "not-hex", ""] {
+            std::fs::write(
+                dir.path().join("MicrosoftGame.config"),
+                format!(
+                    "<Game><TitleId>{title_id}</TitleId><MSAAppId>synthetic-client</MSAAppId></Game>"
+                ),
+            )
+            .expect("write");
+            let err = identity_from_game_dir(dir.path()).expect_err("invalid title ID");
+            assert!(err.contains("TitleId"), "{title_id}: {err}");
+        }
     }
 }
