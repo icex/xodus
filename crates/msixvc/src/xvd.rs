@@ -356,6 +356,22 @@ pub struct SegmentFile {
     pub keep_encrypted: bool,
 }
 
+/// The package header's top hash is not the one it was required to have.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the package header's top hash {} is not the expected {}",
+    hex32(found),
+    hex32(expected)
+)]
+pub struct TopHashMismatch {
+    pub found: [u8; 32],
+    pub expected: [u8; 32],
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// A page whose contents do not hash to what the package's hash tree says.
 #[derive(Debug, thiserror::Error)]
 #[error("page {page} of the package does not match its hash tree")]
@@ -700,7 +716,7 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        Self::parse_ex(file, false).await
+        Self::parse_ex(file, false, None).await
     }
 
     /// Parse a package and check it against itself before trusting any of it.
@@ -716,12 +732,32 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        Self::parse_ex(file, true).await
+        Self::parse_ex(file, true, None).await
+    }
+
+    /// Parse a package as `parse_verified` does, with its header held to a
+    /// top hash that came from somewhere else.
+    ///
+    /// `top_hash` is what the header's `top_hash_block_hash` must be, taken
+    /// from a source the download itself cannot change, such as an
+    /// authenticated package service. The header is compared before anything
+    /// it describes is read, and a header that does not match is refused, so
+    /// the chain from the top hash down to every page is anchored outside the
+    /// download.
+    pub async fn parse_anchored<Reader>(
+        file: Reader,
+        top_hash: &[u8; 32],
+    ) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        Reader: AsyncRead + AsyncSeek + Unpin,
+    {
+        Self::parse_ex(file, true, Some(top_hash)).await
     }
 
     async fn parse_ex<Reader>(
         mut file: Reader,
         verify: bool,
+        top_hash: Option<&[u8; 32]>,
     ) -> Result<Self, Box<dyn std::error::Error>>
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
@@ -731,6 +767,14 @@ impl XvdFile {
             file.read_exact(&mut buf).await?;
             XvdHeader::try_from_array(&buf)?
         };
+        if let Some(expected) = top_hash
+            && xvd_header.top_hash_block_hash != *expected
+        {
+            return Err(Box::new(TopHashMismatch {
+                found: xvd_header.top_hash_block_hash,
+                expected: *expected,
+            }));
+        }
         if xvd_header.number_of_hashed_pages().0 == 0 {
             return Err(Box::new(Error::new(
                 ErrorKind::InvalidData,
@@ -1499,6 +1543,13 @@ pub mod testing {
     }
 
     pub fn package() -> Package {
+        package_with(|_| {})
+    }
+
+    /// The same package with its drive pages changed by `rewrite`, and its
+    /// hash tree and header top hash rebuilt to match: what someone able to
+    /// rewrite the whole download could serve.
+    pub fn package_with(rewrite: impl Fn(&mut [Vec<u8>])) -> Package {
         let mut buf = XvdHeader::buffer();
         let len = buf.len();
         buf.copy_from_slice(&header_bytes(&[0; 32])[..len]);
@@ -1515,6 +1566,7 @@ pub mod testing {
         user_data[8..12].copy_from_slice(&1u32.to_le_bytes());
         let mut data_pages = vec![user_data];
         data_pages.extend((0..DRIVE_PAGES).map(drive_page_bytes));
+        rewrite(&mut data_pages[1..]);
 
         let level0 = level_pages(&data_pages.iter().map(|p| entry(p)).collect::<Vec<_>>());
         let level1 = level_pages(&level0.iter().map(|p| entry(p)).collect::<Vec<_>>());
@@ -1554,9 +1606,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::testing::{DRIVE_PAGES, Package, package};
+    use super::testing::{DRIVE_PAGES, Package, package, package_with};
     use super::{
-        PAGE_SIZE, PageHashMismatch, RetryPolicy, SegmentFile, XvdFile, package_relative_path,
+        PAGE_SIZE, PageHashMismatch, RetryPolicy, SegmentFile, TopHashMismatch, XvdFile,
+        package_relative_path,
     };
 
     fn flip(bytes: &mut [u8], offset: usize) {
@@ -1651,6 +1704,58 @@ mod tests {
         // Unchecked parsing is what the installed container gets, and it
         // takes the tree as it is.
         assert!(XvdFile::parse(Cursor::new(bytes)).await.is_ok());
+    }
+
+    fn top_hash(p: &Package) -> [u8; 32] {
+        p.bytes[0x240..0x260].try_into().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_anchored_package_verifies_when_its_top_hash_matches() {
+        let p = package();
+        let xvd = XvdFile::parse_anchored(Cursor::new(p.bytes.clone()), &top_hash(&p))
+            .await
+            .unwrap();
+        assert!(xvd.verified);
+        assert_eq!(xvd.hashes.hashes.len(), 1 + DRIVE_PAGES);
+    }
+
+    #[tokio::test]
+    async fn an_anchored_package_with_another_top_hash_is_refused() {
+        let p = package();
+        let mut expected = top_hash(&p);
+        expected[31] ^= 0x01;
+        let err = XvdFile::parse_anchored(Cursor::new(p.bytes.clone()), &expected)
+            .await
+            .err()
+            .unwrap();
+        let mismatch = err.downcast_ref::<TopHashMismatch>().expect("{err}");
+        assert_eq!(mismatch.found, top_hash(&p));
+        assert_eq!(mismatch.expected, expected);
+        assert!(err.to_string().contains("top hash"), "{err}");
+
+        // A consistent rewrite -- other drive pages, a tree and a header top
+        // hash rebuilt to match -- checks out against itself, but not against
+        // the top hash of the package it replaced.
+        let rewritten = package_with(|drive| drive[5][0] ^= 0x01);
+        assert_ne!(top_hash(&rewritten), top_hash(&p));
+        assert!(parse_verified(&rewritten.bytes).await.is_ok());
+        let err = XvdFile::parse_anchored(Cursor::new(rewritten.bytes), &top_hash(&p))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
+
+        // A rewritten header is refused on its own, before the tree it names
+        // is read at all: here there is nothing after the header to read.
+        let mut bytes = p.bytes.clone();
+        flip(&mut bytes, 0x240);
+        let truncated = bytes[..PAGE_SIZE].to_vec();
+        let err = XvdFile::parse_anchored(Cursor::new(truncated), &top_hash(&p))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.downcast_ref::<TopHashMismatch>().is_some(), "{err}");
     }
 
     #[tokio::test]

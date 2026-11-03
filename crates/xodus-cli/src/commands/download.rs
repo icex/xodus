@@ -55,7 +55,7 @@ pub async fn run(
     };
     println!();
     for file in files {
-        let url = match package_url(&file.cdn_root_paths, &file.relative_url) {
+        let url = match package_url(&file.cdn_root_paths, &file.relative_url, false) {
             Ok(url) => url,
             Err(err) => {
                 eprintln!("{err}");

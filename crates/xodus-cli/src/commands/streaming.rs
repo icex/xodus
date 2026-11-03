@@ -10,15 +10,15 @@ use futures_util::{TryStreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use msixvc::layout::PAGE_SIZE;
 use msixvc::streaming;
-use msixvc::xvd::{SegmentFile, XvdFile, package_relative_path};
+use msixvc::xvd::{SegmentFile, TopHashMismatch, XvdFile, package_relative_path};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages, package_url};
+use crate::package::{get_content_id, get_packages, header_anchor, package_url, unanchored_note};
 
 struct Job {
     name: String,
@@ -69,19 +69,22 @@ pub async fn run(
             f,
             l,
             &source,
+            None,
             tx,
             rx,
         )
         .await
     } else {
-        let vurl = if source.starts_with("http://") || source.starts_with("https://") {
+        // The top hash the package service vouches for, when the package came
+        // from it and it gave one. A URL given directly has nothing to go by.
+        let (vurl, anchor) = if source.starts_with("http://") || source.starts_with("https://") {
             if source.starts_with("http://") {
                 eprintln!(
                     "warning: {source} is plain http; the package's pages are checked against \
                      its hash tree, but nothing vouches for its header"
                 );
             }
-            source
+            (source, None)
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
                 let content_id_task = get_content_id(client, source, market.clone()).await;
@@ -127,8 +130,18 @@ pub async fn run(
                 }
                 return ExitCode::FAILURE;
             };
-            match package_url(&file.cdn_root_paths, &file.relative_url) {
-                Ok(url) => url,
+            let anchor = match header_anchor(&package) {
+                Ok(anchor) => anchor,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if anchor.is_none() {
+                eprintln!("{}", unanchored_note(file));
+            }
+            match package_url(&file.cdn_root_paths, &file.relative_url, anchor.is_some()) {
+                Ok(url) => (url, anchor),
                 Err(err) => {
                     eprintln!("{err}");
                     return ExitCode::FAILURE;
@@ -175,6 +188,7 @@ pub async fn run(
             http_file,
             l,
             url,
+            anchor,
             tx,
             rx,
         )
@@ -256,6 +270,7 @@ async fn run_cli_reader<Reader>(
     reader: Reader,
     l: u64,
     url: &str,
+    anchor: Option<[u8; 32]>,
     tx: Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
 ) -> Result<(), String>
@@ -321,6 +336,7 @@ where
         reader,
         l,
         url,
+        anchor,
         &tx,
     )
     .await;
@@ -398,6 +414,33 @@ fn needs_download(
     std::fs::metadata(out.join(relative)).map_or(true, |m| m.len() != written_len(remote))
 }
 
+/// Parse a package being downloaded, checked before anything in it is believed.
+///
+/// With `anchor`, the header's top hash must be the one the package service
+/// gave, and a header that is not is refused before the tree it names is read:
+/// see `XvdFile::parse_anchored`. Without one, the package is checked against
+/// itself only, as `XvdFile::parse_verified` does.
+async fn read_header<Reader>(
+    remote_file: &mut Reader,
+    anchor: Option<&[u8; 32]>,
+) -> Result<XvdFile, String>
+where
+    Reader: AsyncRead + AsyncSeek + Unpin,
+{
+    let parsed = match anchor {
+        Some(top_hash) => XvdFile::parse_anchored(remote_file, top_hash).await,
+        None => XvdFile::parse_verified(remote_file).await,
+    };
+    parsed.map_err(|err| match err.downcast_ref::<TopHashMismatch>() {
+        Some(mismatch) => format!(
+            "refusing this download: {mismatch}, which the package service gave as its \
+             HashOfHashes. The package was changed on its way here, or the CDN served \
+             another package; nothing from it was installed"
+        ),
+        None => stopped("read the package header")(err),
+    })
+}
+
 /// Read the container the last install committed, for what it says is there.
 async fn read_installed(final_path: &Path) -> Result<HashMap<String, SegmentFile>, String> {
     let mut file = File::open(final_path).await.map_err(|e| e.to_string())?;
@@ -464,6 +507,7 @@ async fn run_reader<Reader>(
     reader: Reader,
     l: u64,
     url: &str,
+    anchor: Option<[u8; 32]>,
     tx: &Sender<ProgressEvent>,
 ) -> Result<(), String>
 where
@@ -479,11 +523,7 @@ where
     let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
         .await
         .map_err(stopped("open the download cache"))?;
-    // Checked against itself before anything in it is believed: see
-    // `XvdFile::parse_verified`.
-    let remote_xvd = XvdFile::parse_verified(&mut remote_file)
-        .await
-        .map_err(stopped("read the package header"))?;
+    let remote_xvd = read_header(&mut remote_file, anchor.as_ref()).await?;
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let files = remote_xvd
@@ -848,6 +888,42 @@ mod tests {
         commit(out, &cache, &record).unwrap();
         assert_eq!(std::fs::read(&record).unwrap(), b"new");
         assert!(!cache.exists());
+    }
+
+    /// The header is held to the package service's top hash when there is
+    /// one: a match is read, a mismatch refused before the tree is read, and
+    /// with no hash the package is checked against itself as before.
+    #[tokio::test]
+    async fn the_header_is_held_to_the_package_services_hash() {
+        let p = msixvc::xvd::testing::package();
+        let top: [u8; 32] = p.bytes[0x240..0x260].try_into().unwrap();
+        let read = |bytes: Vec<u8>, anchor: Option<[u8; 32]>| async move {
+            read_header(&mut std::io::Cursor::new(bytes), anchor.as_ref()).await
+        };
+
+        // Match.
+        assert!(read(p.bytes.clone(), Some(top)).await.is_ok());
+        // Absent: the package is still checked against itself.
+        assert!(read(p.bytes.clone(), None).await.is_ok());
+        let mut damaged = p.bytes.clone();
+        damaged[p.tree_start * PAGE_SIZE + 3] ^= 1;
+        let err = read(damaged, None).await.err().unwrap();
+        assert!(err.contains("hash tree is damaged"), "{err}");
+
+        // Mismatch: a package rewritten whole, consistent with itself, under
+        // the hash of the package the service named.
+        let rewritten = msixvc::xvd::testing::package_with(|drive| drive[2][9] ^= 1);
+        assert!(read(rewritten.bytes.clone(), None).await.is_ok());
+        let err = read(rewritten.bytes, Some(top)).await.err().unwrap();
+        assert!(err.starts_with("refusing this download"), "{err}");
+        assert!(err.contains("HashOfHashes"), "{err}");
+        assert!(!err.contains("trying again"), "{err}");
+        // The header alone is enough to refuse.
+        let err = read(p.bytes[..PAGE_SIZE].to_vec(), Some([0; 32]))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.starts_with("refusing this download"), "{err}");
     }
 
     /// A package on disk, the parsed package, and a job for pages 5..8 of its

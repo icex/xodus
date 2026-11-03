@@ -1,7 +1,7 @@
 use inquire::Select;
 use xodus::XBOX_LIVE_PACKAGES_PC;
 use xodus::api::displaycatalog::find_products_by_id;
-use xodus::models::packagespc::{PackageDetails, PackageResponse};
+use xodus::models::packagespc::{PackageDetails, PackageFile, PackageResponse};
 use xodus::models::secrets::Token;
 use xodus::tokens::TokenManager;
 
@@ -19,6 +19,75 @@ pub fn available_version(package: &PackageDetails) -> Option<&str> {
     Some(&version[..prefix_len])
 }
 
+/// The top hash a package's header must carry, as the authenticated package
+/// service gives it.
+///
+/// The package service is reached over TLS with the account's token; the CDN it
+/// points to is usually plain http. Its `HashOfHashes` is taken to be the
+/// header's `top_hash_block_hash`: the SHA-256 of the top page of the hash
+/// tree, which is itself a page of hashes, and the one value that every other
+/// check of the download hangs from. Holding the header to it means a download
+/// rewritten on its way -- header, tree and pages together -- is refused rather
+/// than installed.
+///
+/// A SHA-256 in hex or base64 is accepted. Anything else in that field is
+/// refused, since a value this client cannot read is not one it can check.
+/// `None` when the service gives no value, which so far is every package seen:
+/// the install then goes ahead as before, and the caller says so.
+///
+/// The per-file `FileHash` is not used: nothing in the package header
+/// corresponds to it, and a streaming install never reads a whole file to
+/// compare it with a whole-file digest.
+pub fn header_anchor(package: &PackageDetails) -> Result<Option<[u8; 32]>, String> {
+    let Some(value) = package
+        .hash_of_hashes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    sha256_digest(value).map(Some).ok_or_else(|| {
+        format!(
+            "refusing this package: the package service vouches for it with HashOfHashes \
+             {value:?}, which is not a SHA-256 digest, so the download cannot be checked \
+             against it"
+        )
+    })
+}
+
+/// A SHA-256 digest written as 64 hex digits or as base64.
+fn sha256_digest(value: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut digest = [0u8; 32];
+        for (i, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[2 * i..2 * i + 2], 16).ok()?;
+        }
+        return Some(digest);
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+/// What to say about a package the service gave no header hash for.
+pub fn unanchored_note(file: &PackageFile) -> String {
+    let mut note = String::from(
+        "note: the package service gave no HashOfHashes for this package, so its header \
+         is checked against nothing outside the download",
+    );
+    if !file.file_hash.trim().is_empty() {
+        note.push_str(
+            " (it gave a FileHash, which has no counterpart in the package header and \
+             is not used)",
+        );
+    }
+    note
+}
+
 /// Set to `1` to refuse a download when the package service lists only plain
 /// http CDN roots for it.
 pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
@@ -30,20 +99,34 @@ pub const REQUIRE_HTTPS_CDN_ENV: &str = "XODUS_REQUIRE_HTTPS_CDN";
 /// it is, and so far that has meant plain `http://`: the Xbox package CDN hosts
 /// answer https with a certificate for other names, so asking them for the
 /// same path over https fails every time. Over http the pages are still
-/// checked against the package's hash tree, but the header that vouches for
-/// that tree is not, so a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses
-/// such a package instead. A root in any other scheme is refused.
-pub fn package_url(cdn_roots: &[String], relative_url: &str) -> Result<String, String> {
+/// checked against the package's hash tree. The header that vouches for that
+/// tree is held to the package service's hash when it gives one (`anchored`,
+/// see `header_anchor`); when it does not, nothing vouches for the header, and
+/// a note says so. `XODUS_REQUIRE_HTTPS_CDN=1` refuses a plain http package
+/// either way. A root in any other scheme is refused.
+pub fn package_url(
+    cdn_roots: &[String],
+    relative_url: &str,
+    anchored: bool,
+) -> Result<String, String> {
     let url = package_url_with(
         cdn_roots,
         relative_url,
         std::env::var(REQUIRE_HTTPS_CDN_ENV).is_ok_and(|v| v == "1"),
     )?;
     if !has_scheme(&url, "https://") {
-        eprintln!(
-            "note: the package service lists only plain http for this package; its pages \
-             are checked against its hash tree, but nothing vouches for its header"
-        );
+        if anchored {
+            eprintln!(
+                "note: the package service lists only plain http for this package; its \
+                 header is held to the hash the package service gives, and its pages to \
+                 the header's hash tree"
+            );
+        } else {
+            eprintln!(
+                "note: the package service lists only plain http for this package; its pages \
+                 are checked against its hash tree, but nothing vouches for its header"
+            );
+        }
     }
     Ok(url)
 }
@@ -242,6 +325,68 @@ mod tests {
         let mut with_build_id = package;
         with_build_id.version = "3.688.109.0.3b6b700a-992b-45fc-b16b-4ea65141d98c".into();
         assert_eq!(available_version(&with_build_id), Some("3.688.109.0"));
+    }
+
+    fn details(hash_of_hashes: Option<&str>) -> PackageDetails {
+        PackageDetails {
+            package_found: true,
+            content_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            version_id: "version-id".into(),
+            package_files: Vec::new(),
+            version: "1.0.0.0".into(),
+            hash_of_hashes: hash_of_hashes.map(str::to_string),
+            update_predownload: false,
+            availability_date: "2026-09-08T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn the_header_anchor_is_the_services_hash_of_hashes() {
+        let digest: [u8; 32] = std::array::from_fn(|i| (i * 9 + 1) as u8);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+        for value in [
+            hex.clone(),
+            hex.to_ascii_uppercase(),
+            b64,
+            format!(" {hex}\n"),
+        ] {
+            assert_eq!(
+                header_anchor(&details(Some(&value))),
+                Ok(Some(digest)),
+                "{value:?}"
+            );
+        }
+        // Absent, null or empty: nothing to hold the header to.
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(header_anchor(&details(value)), Ok(None), "{value:?}");
+        }
+        // Present but not a SHA-256: refused, not ignored.
+        for value in [
+            "not a digest",
+            &hex[..62],
+            &format!("{hex}00"),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAA=", // 20 bytes
+            &format!("{}zz", &hex[..62]),
+        ] {
+            let err = header_anchor(&details(Some(value))).unwrap_err();
+            assert!(err.starts_with("refusing this package"), "{value:?}: {err}");
+        }
+        // The service's answer as it comes, with the field missing or null.
+        let missing: PackageDetails = serde_json::from_value(serde_json::json!({
+            "PackageFound": true, "ContentId": "c", "VersionId": "v", "PackageFiles": [],
+            "Version": "1.0.0.0", "UpdatePredownload": false, "AvailabilityDate": "d"
+        }))
+        .unwrap();
+        assert_eq!(header_anchor(&missing), Ok(None));
+        let given: PackageDetails = serde_json::from_value(serde_json::json!({
+            "PackageFound": true, "ContentId": "c", "VersionId": "v", "PackageFiles": [],
+            "Version": "1.0.0.0", "HashOfHashes": hex, "UpdatePredownload": false,
+            "AvailabilityDate": "d"
+        }))
+        .unwrap();
+        assert_eq!(header_anchor(&given), Ok(Some(digest)));
     }
 
     #[test]
