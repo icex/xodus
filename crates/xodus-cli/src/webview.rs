@@ -4,7 +4,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowT
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Window, WindowBuilder};
 use wry::http::{HeaderMap, HeaderValue};
-use wry::{PageLoadEvent, WebView, WebViewBuilder};
+use wry::{PageLoadEvent, WebContext, WebView, WebViewBuilder};
 use xodus::models::live::{DAProperty, HostBridgeMessage};
 
 type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -75,6 +75,10 @@ struct RuntimeState<T: SessionHandler> {
     active_webview: Option<WebView>,
     result: Option<T::Output>,
     error: Option<String>,
+    web_context: WebContext,
+    // One isolated browser store per login process, shared across MFA pages.
+    // Drop views/context before removing their temporary cookies.
+    _browser_data: tempfile::TempDir,
 }
 
 impl RuntimeCommands {
@@ -157,6 +161,8 @@ where
 {
     let mut event_loop: EventLoop<CustomEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let browser_data = tempfile::Builder::new().prefix("xodus-signin-").tempdir()?;
+    let web_context = WebContext::new(Some(browser_data.path().to_path_buf()));
     let mut state = RuntimeState {
         handler,
         next_session_id: 1,
@@ -165,6 +171,8 @@ where
         active_webview: None,
         result: None,
         error: None,
+        web_context,
+        _browser_data: browser_data,
     };
 
     let mut commands = RuntimeCommands::new(state.next_session_id);
@@ -332,7 +340,7 @@ fn create_session<T: SessionHandler>(
     window.set_title(&request.title);
 
     let proxy_ipc = proxy.clone();
-    let builder = WebViewBuilder::new()
+    let builder = WebViewBuilder::new_with_web_context(&mut state.web_context)
             .with_url(&request.url)
             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
             .with_headers(request.headers)

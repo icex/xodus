@@ -11,15 +11,18 @@ const LOGIN_MARKET: &str = "en-US";
 const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
 
 pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
-    let token = tokens.get_device_sts_token().unwrap();
-    let secrets::Token::Legacy(token) = token else {
+    let Ok(secrets::Token::Legacy(token)) = tokens.get_device_sts_token() else {
         eprintln!("Invalid STS token");
         return ExitCode::FAILURE;
     };
     let handler = LoginHandler::new(client.clone(), token, tokens.clone());
-    let output = webview::run_sessions(handler)
-        .expect("failed to login")
-        .flatten();
+    let output = match webview::run_sessions(handler) {
+        Ok(output) => output.flatten(),
+        Err(_) => {
+            eprintln!("Sign-in did not complete. Check the account window, network and keychain.");
+            return ExitCode::FAILURE;
+        }
+    };
     let issued_tokens = match output {
         Some(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => {
             collection.security_tokens
@@ -32,6 +35,9 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         _ => unreachable!(),
     };
 
+    if issued_tokens.is_empty() {
+        return ExitCode::FAILURE;
+    }
     for token in issued_tokens {
         let address = token.applies_to.endpoint_reference.address.clone();
         let token = token.into();
@@ -40,7 +46,10 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         } else {
             address
         };
-        tokens.save_user_token(address, token).unwrap();
+        if tokens.save_user_token(address, token).is_err() {
+            eprintln!("Could not save the new sign-in to your keychain");
+            return ExitCode::FAILURE;
+        }
     }
 
     ExitCode::SUCCESS
@@ -162,7 +171,7 @@ impl webview::SessionHandler for LoginHandler {
                         puid: data.puid,
                         username: data.username,
                     })
-                    .unwrap();
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
                 Ok(webview::HandlerControl::Complete(Some(da)))
             }
         }

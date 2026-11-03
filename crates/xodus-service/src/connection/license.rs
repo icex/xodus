@@ -143,8 +143,20 @@ where
 }
 
 pub(super) async fn fetch(context: &mut SimpleContext, xml: &[u8]) -> Result<String, Error> {
+    // A service bound to one title signs licence requests for that title
+    // only: the Store account's token is not the running game's to spend on
+    // another product it happens to own.
+    if let Some(bound) = &context.entitlement {
+        let req: LicenseTokenIpcRequest =
+            quick_xml::de::from_str(std::str::from_utf8(xml).map_err(|_| "invalid IPC request")?)
+                .map_err(|_| "invalid IPC request")?;
+        if !req.parent_product_id.eq_ignore_ascii_case(bound.product()) {
+            return Err("licence token request is for another title");
+        }
+    }
+    let mut store = context.store_context();
     fetch_with(xml, URL, &client(HTTP_TIMEOUT)?, |req| async move {
-        super::xml::xsts_token(context, req)
+        super::xml::xsts_token(&mut store, req)
             .await
             .map_err(|_| "licensing authorization failed")
     })

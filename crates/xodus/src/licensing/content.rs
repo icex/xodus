@@ -13,6 +13,8 @@ use crate::models::licensing::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum LicenseContentError {
+    #[error("invalid licensing response")]
+    InvalidResponse,
     #[error("request error: {0}")]
     Request(#[from] reqwest::Error),
 
@@ -71,9 +73,18 @@ pub async fn get_license_content(
             });
         }
     };
-    let license = &content.keys[0].value;
-    let license = BASE64_STANDARD.decode(license).unwrap();
-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
+    let license = &content
+        .keys
+        .first()
+        .ok_or(LicenseContentError::InvalidResponse)?
+        .value;
+    let license = BASE64_STANDARD
+        .decode(license)
+        .map_err(|_| LicenseContentError::InvalidResponse)?;
+    let license = quick_xml::de::from_str::<License>(
+        std::str::from_utf8(&license).map_err(|_| LicenseContentError::InvalidResponse)?,
+    )
+    .map_err(|_| LicenseContentError::InvalidResponse)?;
     Ok((content, license))
 }
 

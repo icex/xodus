@@ -316,3 +316,17 @@ async fn chunked_bodies_are_parsed_and_bounded_without_content_length() {
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn a_title_bound_service_signs_licence_requests_for_that_title_only() {
+    let mut context = crate::simple_context::tests::context("owner-bound", "player-bound");
+    context.entitlement = Some(crate::entitlement::Entitlement::fixture("9OTHERSTORE0"));
+    let xml = format!(
+        "<LicenseTokenRequest><ParentProductId>9TESTSTORE0ID</ParentProductId><ProductIds><ProductId>9TESTADDON00</ProductId></ProductIds><CustomBase64>{}</CustomBase64><TitleId>123</TitleId></LicenseTokenRequest>",
+        STANDARD.encode("fixture")
+    );
+    assert_eq!(
+        super::fetch(&mut context, xml.as_bytes()).await,
+        Err("licence token request is for another title")
+    );
+}

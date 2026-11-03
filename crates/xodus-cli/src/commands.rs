@@ -7,6 +7,7 @@ pub mod extract_eappx;
 pub mod license;
 pub mod login;
 pub mod logout;
+pub mod profiles;
 #[cfg(unix)]
 pub mod run;
 pub mod splicense;

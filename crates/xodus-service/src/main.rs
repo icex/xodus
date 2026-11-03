@@ -10,6 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use xodus::tokens::TokenManager;
 
 mod connection;
+mod entitlement;
 mod simple_context;
 mod utils;
 
@@ -18,6 +19,12 @@ const PROTO_MAGIC: u32 = 0x58445350;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|arg| arg == "--capabilities") {
+        println!(
+            "{{\"schema\":1,\"protocol\":\"FERESTRE_ACCOUNT_ROLES_SERVICE_V1\",\"capabilities\":[\"store-player-accounts\"]}}"
+        );
+        return;
+    }
     // Default to info rather than to the EnvFilter's own error-only default.
     // The service's log is the only place the reason a title's Xbox call was
     // refused ever appears -- the title itself just sees the 403 -- and a log
@@ -47,7 +54,23 @@ async fn main() {
     }
 
     xodus::secrets::init_secrets().expect("Failed to init keychain");
-    let tokens = Arc::new(TokenManager::with_keychain_and_memory());
+    let root = xodus::profiles::root().expect("Account profile directory unavailable");
+    let default = xodus::profiles::default_id(&root).expect("Invalid default account profile");
+    let select = |role: &str| {
+        let id = std::env::var(role).ok().or_else(|| default.clone());
+        match id {
+            Some(id) => {
+                xodus::profiles::load(&root, &id).expect("Selected account profile is unavailable");
+                TokenManager::for_profile(&id).expect("Invalid account profile")
+            }
+            None => TokenManager::with_keychain_and_memory(),
+        }
+        .pin_user()
+        .expect("Selected account is signed out or invalid")
+    };
+    let tokens = Arc::new(select("XODUS_PLAYER_PROFILE"));
+    let store_tokens = Arc::new(select("XODUS_STORE_PROFILE"));
+    let entitlement = entitlement::Entitlement::from_env().expect("Invalid Store title binding");
     xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
     let xodus::models::secrets::Token::Legacy(device_token) =
         tokens.get_device_sts_token().unwrap()
@@ -80,8 +103,18 @@ async fn main() {
             let token = cancellation.clone();
             let device_token = device_token.clone();
             let tokens = tokens.clone();
+            let store_tokens = store_tokens.clone();
+            let entitlement = entitlement.clone();
             tokio::spawn(async move {
-                connection::router::route(accept.0, token, device_token, tokens).await
+                connection::router::route(
+                    accept.0,
+                    token,
+                    device_token,
+                    tokens,
+                    store_tokens,
+                    entitlement,
+                )
+                .await
             });
         }
     }

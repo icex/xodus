@@ -33,12 +33,14 @@ fn setting(profile: &serde_json::Value, id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn run(client: &reqwest::Client, tokens: &xodus::tokens::TokenManager, json: bool) -> ExitCode {
+pub async fn describe(
+    client: &reqwest::Client,
+    tokens: &xodus::tokens::TokenManager,
+) -> Result<serde_json::Value, String> {
     let xsts = match xsts_for(client, tokens, XBOXLIVE_RELYING_PARTY).await {
         Ok(xsts) => xsts,
         Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::FAILURE;
+            return Err(message);
         }
     };
     // From the token itself, so these survive a profile service that is down.
@@ -72,8 +74,36 @@ pub async fn run(client: &reqwest::Client, tokens: &xodus::tokens::TokenManager,
         Err(message) => eprintln!("profile settings: {message}"),
     }
 
+    if let Some(id) = tokens.profile_id() {
+        if let Ok(root) = xodus::profiles::root() {
+            if let Ok(mut profile) = xodus::profiles::load(&root, id) {
+                if let Some(label) = account["gamertag"].as_str().filter(|s| !s.is_empty()) {
+                    profile.label = label.into();
+                    let _ = xodus::profiles::save(&root, &profile);
+                }
+            }
+        }
+    }
+    Ok(account)
+}
+
+pub async fn run(
+    client: &reqwest::Client,
+    tokens: &xodus::tokens::TokenManager,
+    json: bool,
+) -> ExitCode {
+    let account = match describe(client, tokens).await {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if json {
-        println!("{}", serde_json::to_string_pretty(&account).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&account).unwrap_or_default()
+        );
     } else {
         let gamertag = account["gamertag"].as_str().unwrap_or("");
         if gamertag.is_empty() {

@@ -14,6 +14,132 @@ mod keys {
     pub const USER_INFO: &str = "user-DA";
 }
 
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::tokens::store::TokenBackend;
+    const OWNER: &str = "11111111111111111111111111111111";
+    const PLAYER: &str = "22222222222222222222222222222222";
+
+    fn user(puid: &str) -> User {
+        User {
+            puid: puid.into(),
+            username: "offline fixture".into(),
+        }
+    }
+
+    #[test]
+    fn profiles_isolate_user_tokens_and_logout_without_replacing_the_device() {
+        let legacy = TokenManager::with_memory();
+        let owner = legacy.scoped(OWNER).unwrap();
+        let player = legacy.scoped(PLAYER).unwrap();
+        legacy.save_user(&user("legacy-fixture")).unwrap();
+        owner.save_user(&user("owner-fixture")).unwrap();
+        player.save_user(&user("player-fixture")).unwrap();
+        owner
+            .save_user_token(PASSPORT_STS.into(), Token::Compact("owner-fixture".into()))
+            .unwrap();
+        player
+            .save_user_token(PASSPORT_STS.into(), Token::Compact("player-fixture".into()))
+            .unwrap();
+        owner
+            .save_device_token(
+                PASSPORT_STS.into(),
+                Token::Compact("shared-device-fixture".into()),
+            )
+            .unwrap();
+        assert_eq!(legacy.get_user().unwrap().puid, "legacy-fixture");
+        assert_eq!(owner.get_user().unwrap().puid, "owner-fixture");
+        assert_eq!(player.get_user().unwrap().puid, "player-fixture");
+        assert!(
+            matches!(owner.get_user_sts_token().unwrap(),Token::Compact(s) if s=="owner-fixture")
+        );
+        assert!(
+            matches!(player.get_user_sts_token().unwrap(),Token::Compact(s) if s=="player-fixture")
+        );
+        assert!(
+            matches!(player.get_device_sts_token().unwrap(),Token::Compact(s) if s=="shared-device-fixture")
+        );
+        owner.remove_persistent().unwrap();
+        assert!(owner.get_user().is_err());
+        assert_eq!(player.get_user().unwrap().puid, "player-fixture");
+        assert!(legacy.get_device_sts_token().is_ok());
+        assert!(player.scoped("../owner").is_err());
+    }
+
+    #[test]
+    fn a_live_service_cannot_follow_replacement_credentials_in_its_profile() {
+        let backend = TokenManager::with_memory();
+        let profile = backend.scoped(OWNER).unwrap();
+        profile.save_user(&user("original-fixture")).unwrap();
+        profile
+            .save_user_token(
+                PASSPORT_STS.into(),
+                Token::Compact("original-fixture".into()),
+            )
+            .unwrap();
+        let pinned = profile.clone().pin_user().unwrap();
+        profile.save_user(&user("replacement-fixture")).unwrap();
+        profile
+            .save_user_token(
+                PASSPORT_STS.into(),
+                Token::Compact("replacement-fixture".into()),
+            )
+            .unwrap();
+        assert!(pinned.get_user().is_err());
+        assert!(pinned.get_user_sts_token().is_err());
+    }
+
+    struct InterruptCopy {
+        inner: MemoryBackend,
+        interrupt: std::sync::atomic::AtomicBool,
+    }
+    impl TokenBackend for InterruptCopy {
+        fn get(&self, k: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            self.inner.get(k)
+        }
+        fn set(&self, k: &str, v: &[u8]) -> Result<(), TokenStoreError> {
+            if k.ends_with("/user-DA")
+                && self
+                    .interrupt
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("simulated interrupted migration").into());
+            }
+            self.inner.set(k, v)
+        }
+        fn remove(&self, k: &str) -> Result<(), TokenStoreError> {
+            self.inner.remove(k)
+        }
+    }
+
+    #[test]
+    fn interrupted_migration_keeps_legacy_credentials_and_retries_without_crossing_profiles() {
+        let backend = Arc::new(InterruptCopy {
+            inner: MemoryBackend::default(),
+            interrupt: std::sync::atomic::AtomicBool::new(true),
+        });
+        let legacy = TokenManager::new(backend, Arc::new(MemoryBackend::default()));
+        legacy.save_user(&user("original-fixture")).unwrap();
+        legacy
+            .save_user_token(
+                PASSPORT_STS.into(),
+                Token::Compact("original-fixture".into()),
+            )
+            .unwrap();
+        assert!(legacy.migrate_user_to(OWNER).is_err());
+        assert_eq!(legacy.get_user().unwrap().puid, "original-fixture");
+        assert!(legacy.scoped(OWNER).unwrap().get_user().is_err());
+        legacy.migrate_user_to(OWNER).unwrap();
+        assert_eq!(
+            legacy.scoped(OWNER).unwrap().get_user().unwrap().puid,
+            "original-fixture"
+        );
+        assert!(legacy.scoped(PLAYER).unwrap().get_user().is_err());
+        assert!(legacy.get_user_sts_token().is_ok());
+    }
+}
+
 pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
 
 /// Semantic facade over the two storage tiers: a persistent, keychain-backed tier
@@ -24,6 +150,8 @@ pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
 pub struct TokenManager {
     persistent: Arc<dyn TokenBackend>,
     ephemeral: Arc<dyn ExpiringTokenBackend>,
+    profile: Option<String>,
+    expected_user: Option<String>,
 }
 
 impl TokenManager {
@@ -34,6 +162,8 @@ impl TokenManager {
         Self {
             persistent,
             ephemeral,
+            profile: None,
+            expected_user: None,
         }
     }
 
@@ -46,6 +176,72 @@ impl TokenManager {
         )
     }
 
+    /// Device registration is shared; only user credentials are namespaced.
+    /// Every manager has its own ephemeral token cache, even for the same RP.
+    pub fn for_profile(profile: &str) -> Result<Self, TokenStoreError> {
+        Self::with_keychain_and_memory().scoped(profile)
+    }
+
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    pub fn scoped(&self, profile: &str) -> Result<Self, TokenStoreError> {
+        if !crate::profiles::valid_id(profile) {
+            return Err(std::io::Error::other("invalid account profile ID").into());
+        }
+        Ok(Self {
+            persistent: self.persistent.clone(),
+            ephemeral: Arc::new(MemoryBackend::default()),
+            profile: Some(profile.into()),
+            expected_user: None,
+        })
+    }
+
+    fn user_key(&self, key: &str) -> String {
+        match &self.profile {
+            Some(id) => format!("profile/{id}/{key}"),
+            None => key.into(),
+        }
+    }
+
+    /// A running service may refresh credentials, but never change identity.
+    pub fn pin_user(mut self) -> Result<Self, TokenStoreError> {
+        let user = self.get_user()?;
+        self.get_user_sts_token()?;
+        if user.puid.is_empty() {
+            return Err(std::io::Error::other("account has no verified MSA identity").into());
+        }
+        self.expected_user = Some(user.puid);
+        Ok(self)
+    }
+
+    pub fn migrate_user_to(&self, profile: &str) -> Result<(), TokenStoreError> {
+        let target = self.scoped(profile)?;
+        for key in [keys::USER_TOKENS, keys::USER_INFO] {
+            let value = self
+                .persistent
+                .get(&self.user_key(key))?
+                .ok_or(TokenStoreError::NotFound)?;
+            let dest = target.user_key(key);
+            self.persistent.set(&dest, &value)?;
+            if self.persistent.get(&dest)?.as_deref() != Some(value.as_slice()) {
+                return Err(std::io::Error::other("account migration verification failed").into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove_user(&self) -> Result<(), TokenStoreError> {
+        for key in [keys::USER_TOKENS, keys::USER_INFO] {
+            let key = self.user_key(key);
+            if self.persistent.get(&key)?.is_some() {
+                self.persistent.remove(&key)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Keychain for persistent storage, in-memory for ephemeral - the default
     /// wiring for both `xodus-cli` and `xodus-service` today.
     pub fn with_memory() -> Self {
@@ -56,6 +252,9 @@ impl TokenManager {
     }
 
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
+        if self.profile.is_some() {
+            return self.remove_user();
+        }
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;
         self.persistent.remove(keys::USER_INFO)
@@ -98,11 +297,26 @@ impl TokenManager {
     // ---- User STS tokens (keyed by SOAP "applies_to" address) --------------
 
     pub fn get_user_token_for(&self, address: &str) -> Result<Option<Token>, TokenStoreError> {
-        Self::read_token_store(&*self.persistent, keys::USER_TOKENS, address)
+        if self.expected_user.is_some() {
+            self.get_user()?;
+        }
+        Self::read_token_store(
+            &*self.persistent,
+            &self.user_key(keys::USER_TOKENS),
+            address,
+        )
     }
 
     pub fn save_user_token(&self, address: String, token: Token) -> Result<(), TokenStoreError> {
-        Self::write_token_store(&*self.persistent, keys::USER_TOKENS, address, token)
+        if self.expected_user.is_some() {
+            self.get_user()?;
+        }
+        Self::write_token_store(
+            &*self.persistent,
+            &self.user_key(keys::USER_TOKENS),
+            address,
+            token,
+        )
     }
 
     pub fn get_user_sts_token(&self) -> Result<Token, TokenStoreError> {
@@ -115,19 +329,33 @@ impl TokenManager {
     pub fn get_user(&self) -> Result<User, TokenStoreError> {
         let bytes = self
             .persistent
-            .get(keys::USER_INFO)?
+            .get(&self.user_key(keys::USER_INFO))?
             .ok_or(TokenStoreError::NotFound)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let user: User = serde_json::from_slice(&bytes)?;
+        if self
+            .expected_user
+            .as_ref()
+            .is_some_and(|expected| *expected != user.puid)
+        {
+            return Err(std::io::Error::other(
+                "account changed while a game was running; launch again",
+            )
+            .into());
+        }
+        Ok(user)
     }
 
     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
         self.persistent
-            .set(keys::USER_INFO, &serde_json::to_vec(user)?)
+            .set(&self.user_key(keys::USER_INFO), &serde_json::to_vec(user)?)
     }
 
     // ---- Ephemeral XSTS-by-relying-party cache --------------------------------
 
     pub fn get_cached_xsts(&self, relying_party: &str) -> Option<XstsResponse> {
+        if self.expected_user.is_some() && self.get_user().is_err() {
+            return None;
+        }
         let bytes = self.ephemeral.get(relying_party).ok()??;
         serde_json::from_slice(&bytes).ok()
     }

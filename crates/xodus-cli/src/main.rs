@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use xodus::tokens::TokenManager;
 
 mod commands;
 mod license;
@@ -13,11 +12,24 @@ mod webview;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    /// List local account profiles; credentials never leave the keychain.
+    AccountProfiles {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import the existing sign-in without removing legacy credentials.
+    MigrateAccounts,
+    /// Sign in to a new, separate account profile.
+    AddAccount,
     #[command(
         about = "Probe an authenticated Microsoft endpoint (research: owned-title enumeration)"
     )]
     Library {
-        #[arg(long, default_value_t = 100, help = "Page size for the collections query")]
+        #[arg(
+            long,
+            default_value_t = 100,
+            help = "Page size for the collections query"
+        )]
         page_size: u32,
         #[arg(
             long,
@@ -25,7 +37,11 @@ enum SubCommand {
             help = "MSA ticket target; the licensing path uses www.microsoft.com"
         )]
         msa_target: String,
-        #[arg(long, default_value_t = false, help = "Keep add-ons, passes and inactive entitlements")]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Keep add-ons, passes and inactive entitlements"
+        )]
         all: bool,
         #[arg(long, default_value_t = false, help = "Emit JSON")]
         json: bool,
@@ -75,7 +91,10 @@ enum SubCommand {
         game_dir: Option<std::path::PathBuf>,
         #[arg(long, help = "Decimal TitleId, instead of reading the game directory")]
         title_id: Option<i64>,
-        #[arg(long, help = "The title's MSAAppId, instead of reading the game directory")]
+        #[arg(
+            long,
+            help = "The title's MSAAppId, instead of reading the game directory"
+        )]
         title_client_id: Option<String>,
     },
     #[command(about = "Report the available version for an installed MSIXVC package")]
@@ -190,6 +209,9 @@ enum ClepAction {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct CliArgs {
+    /// Select an account profile for this command (defaults to the imported account).
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: SubCommand,
 }
@@ -223,7 +245,37 @@ async fn main() -> ExitCode {
     let args = CliArgs::parse();
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
-    let tokens = TokenManager::with_keychain_and_memory();
+    let profile_root = match xodus::profiles::root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("Account profiles: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match &args.command {
+        SubCommand::AccountProfiles { json } => {
+            return commands::profiles::list(&profile_root, *json);
+        }
+        SubCommand::MigrateAccounts => return commands::profiles::migrate(&profile_root),
+        SubCommand::AddAccount => return commands::profiles::add(&client, &profile_root).await,
+        _ => {}
+    }
+    let profile = args
+        .profile
+        .or_else(|| std::env::var("XODUS_ACCOUNT_PROFILE").ok());
+    let tokens = match commands::profiles::manager(&profile_root, profile.as_deref()) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            eprintln!("Account profile: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if tokens.profile_id().is_some() && matches!(args.command, SubCommand::Login) {
+        eprintln!(
+            "Use add-account for a separate sign-in; an existing profile cannot change identity"
+        );
+        return ExitCode::FAILURE;
+    }
 
     // Clep/SpLicense are pure local data transforms and Logout only removes
     // stored credentials - none of them need a device identity, so don't
@@ -260,6 +312,9 @@ async fn main() -> ExitCode {
             .await
         }
         SubCommand::Login => commands::login::run(&client, &tokens).await,
+        SubCommand::AccountProfiles { .. }
+        | SubCommand::MigrateAccounts
+        | SubCommand::AddAccount => unreachable!(),
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
             path,
@@ -342,10 +397,13 @@ async fn main() -> ExitCode {
                 Ok(package) => match package::available_version(&package) {
                     Some(version) => {
                         if json {
-                            println!("{}", serde_json::json!({
-                                "content_id": content_id,
-                                "version": version,
-                            }));
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "content_id": content_id,
+                                    "version": version,
+                                })
+                            );
                         } else {
                             println!("{version}");
                         }
