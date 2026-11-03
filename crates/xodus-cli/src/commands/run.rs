@@ -220,16 +220,28 @@ pub async fn run(
         }
 
         let nt_suffix = fd.0.trim_start_matches('\\');
-        let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
+        // Two spellings of one path, and they are not interchangeable.
+        //
+        // The map is keyed by the NT path, because that is the name the loader
+        // has in hand when it decides whether an image comes from a descriptor.
+        //
+        // What gets passed as the command line has to be the ordinary Win32
+        // path. Proton hands it to steam.exe, which calls CreateProcessW with a
+        // null application name -- so the string is parsed as a Win32 path, and
+        // an NT one is treated as relative: `\??\Z:\...` becomes
+        // `Z:\??\Z:\...`, which resolves to nothing and surfaces as
+        // "Failed to create process ...: 2" with the file plainly on disk.
+        let win32_path = format!("Z:{}\\{}", nt_prefix, nt_suffix);
+        let nt_path = format!("\\??\\{win32_path}");
         if let Some(exe) = &exe {
             if exe == fd.0 {
-                nt_entry = Some(nt_path)
+                nt_entry = Some(win32_path)
             }
         } else if nt_entry.is_none() {
-            nt_entry = Some(nt_path)
+            nt_entry = Some(win32_path)
         }
 
-        env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
+        env_value.push_str(&format!("{}:{}", fd.1, nt_path))
     }
 
     let Some(nt_entry) = nt_entry else {
