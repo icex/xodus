@@ -266,7 +266,7 @@ async fn msa_user_ticket(
         _ => return Err("unexpected MSA response shape".into()),
     };
     match token {
-        Token::Compact(ticket) => Ok(ticket),
+        Token::Compact(ticket) => Ok(xodus::licensing::store_ticket::user_ticket(ticket)),
         Token::Legacy(_) => {
             Err("MSA exchange returned a legacy token, wanted a compact one".into())
         }
