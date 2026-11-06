@@ -54,7 +54,7 @@ pub async fn get_license_content(
                 [(utils::generate_suid(),
                 vec![LicenseUserIdentity {
                     identity_type: "Msa".to_string(),
-                    identity_value: user_ms_token,
+                    identity_value: crate::licensing::store_ticket::user_ticket(user_ms_token),
                     local_ticket_reference: ticket_reference,
                 }])],
             ),
@@ -112,7 +112,7 @@ pub async fn get_license_token(
             custom_developer_string,
             beneficiaries: vec![LicenseUserIdentity {
                 identity_type: "Msa".to_string(),
-                identity_value: user_ms_token,
+                identity_value: crate::licensing::store_ticket::user_ticket(user_ms_token),
                 local_ticket_reference: ticket_reference,
             }],
         })
