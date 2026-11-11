@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   wiki:
-    runs-on: ubuntu-slim
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     steps:
       - name: Checkout repo docs
         uses: actions/checkout@v7

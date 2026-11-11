@@ -8,29 +8,38 @@ on:
 jobs:
   fmt:
     name: Check fmt
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, icex-ci]
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+          components: rustfmt
       - run: cargo fmt --check --all
   check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64, icex-ci]
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
-        if: ${{runner.os == 'Linux'}}
+        if: (runner.os == 'Linux') && runner.environment != 'self-hosted'
         run: sudo apt update && sudo apt install libwebkit2gtk-4.1-dev protobuf-compiler
       - name: Install protobuf
         if: ${{ runner.os == 'macOS' }}
         run: brew install protobuf
       - name: Update Rust toolchain
-        run: rustup update
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+          components: clippy
       - uses: actions/cache@v5
         with:
           path: |
