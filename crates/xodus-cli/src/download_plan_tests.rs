@@ -126,6 +126,67 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn new_file_windows_use_the_requested_range_parallelism() {
+    let drive_pages = 8 * REQUEST_PAGES + 1;
+    let package = msixvc::xvd::testing::package_with_drive_pages(drive_pages, |_| {});
+    let start = package.drive_page * PAGE_SIZE;
+    let length = drive_pages * PAGE_SIZE;
+    let expected = package.bytes[start..start + length].to_vec();
+    let xvd = XvdFile::parse_verified(&mut std::io::Cursor::new(&package.bytes))
+        .await
+        .unwrap();
+    let server = Server::new(package.bytes, 206);
+    let client = client();
+
+    for (parallel, expected_windows) in [(4, &[4, 4, 1][..]), (5, &[5, 4]), (8, &[8, 1])] {
+        server.ranges.lock().unwrap().clear();
+        let root = tempfile::tempdir().unwrap();
+        let entry = Entry {
+            name: "payload.dat".into(),
+            content: SegmentFile {
+                offset: start as u64,
+                length: length as u64,
+                data_hashs: vec![],
+                keep_encrypted: false,
+            },
+        };
+        let mut previous = 0;
+        let mut window_ranges = vec![];
+        execute(
+            &client,
+            &xvd,
+            vec![entry],
+            &HashMap::new(),
+            root.path(),
+            &server.url,
+            [0; 32],
+            parallel,
+            |durable| {
+                if durable != 0 {
+                    let observed = server.ranges.lock().unwrap().len();
+                    window_ranges.push(observed - previous);
+                    previous = observed;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(window_ranges, expected_windows, "parallel={parallel}");
+        assert_eq!(fs::read(root.path().join("payload.dat")).unwrap(), expected);
+        let mut ranges = server.ranges.lock().unwrap();
+        ranges.sort_unstable();
+        for (i, &(first, last)) in ranges.iter().enumerate() {
+            let request_start = start + i * REQUEST_PAGES * PAGE_SIZE;
+            assert_eq!(first, request_start);
+            assert_eq!(
+                last,
+                (request_start + REQUEST_PAGES * PAGE_SIZE).min(start + length) - 1
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn authentic_local_content_needs_no_network_request() {
     let (_, xvd, entry, expected) = fixture(false).await;
     let root = tempfile::tempdir().unwrap();

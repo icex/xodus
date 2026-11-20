@@ -257,9 +257,11 @@ async fn one_file(
     advanced(offset);
     let source = read_only(&target).map_err(|e| e.to_string())?;
     let positions = old_positions(old);
+    // A fresh file needs one full range per worker to use the requested parallelism.
+    let window = WINDOW.max(parallel * REQUEST_PAGES * PAGE_SIZE) as u64;
     while offset < length {
         session.ready().await?;
-        let end = offset.saturating_add(WINDOW as u64).min(length);
+        let end = offset.saturating_add(window).min(length);
         let mut data = vec![0u8; (end - offset) as usize];
         let valid = tokio::task::block_in_place(|| {
             fill_local(
