@@ -1,3 +1,4 @@
+mod b2b_key;
 mod catalog;
 mod license;
 pub mod proto;

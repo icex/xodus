@@ -101,6 +101,11 @@ async fn route_context(
                     _ => return,
                 }
             }
+            super::b2b_key::MAGIC => match super::b2b_key::handle(&mut socket, &context).await {
+                Ok(true) => Ok(()),
+                Ok(false) => return,
+                Err(e) => Err(e.into()),
+            },
             0x58445343 => super::catalog::handle(&mut socket).await,
             crate::PROTO_MAGIC => super::proto::handle(&mut socket, &mut context).await,
             _ => {
