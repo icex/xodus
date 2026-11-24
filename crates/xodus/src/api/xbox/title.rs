@@ -75,9 +75,15 @@ fn endpoint_specificity(
     if !matches_host {
         return None;
     }
-    let path = endpoint.path.as_deref().unwrap_or("");
-    if !path.is_empty() && url.path() != path {
-        let rest = url.path().strip_prefix(path)?;
+    // Some titles list a path without its leading slash ("auth/ds").
+    let path = endpoint
+        .path
+        .as_deref()
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let requested = url.path().trim_start_matches('/');
+    if !path.is_empty() && requested != path {
+        let rest = requested.strip_prefix(path)?;
         if !path.ends_with('/') && !rest.starts_with('/') {
             return None;
         }
@@ -296,6 +302,27 @@ mod nsal_tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_without_its_leading_slash_still_matches() {
+        let list = response(
+            serde_json::json!([
+                {"Protocol": "https", "Host": "game.example.test", "HostType": "fqdn",
+                 "Path": "auth/ds", "RelyingParty": "rp://game.example.test/"},
+                {"Protocol": "https", "Host": "*", "HostType": "wildcard"},
+            ]),
+            0,
+        );
+        let found = |path: &str| {
+            get_endpoint(&format!("https://game.example.test{path}"), &list)
+                .and_then(|e| e.relying_party.as_deref())
+        };
+        let rp = Some("rp://game.example.test/");
+        assert_eq!(found("/auth/ds"), rp);
+        assert_eq!(found("/auth/ds/more"), rp);
+        assert_eq!(found("/auth/dsx"), None);
+        assert_eq!(found("/other"), None);
     }
 
     #[test]
