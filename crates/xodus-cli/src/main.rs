@@ -165,7 +165,11 @@ enum SubCommand {
             help = "Attempt to skip downloading NTFS metadata to be faste while missing some files"
         )]
         try_skip_ntfs: bool,
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            help = "Concurrent download ranges (default: 8, maximum: 8)"
+        )]
         parallel: Option<usize>,
         #[arg(short, long)]
         market: Option<String>,

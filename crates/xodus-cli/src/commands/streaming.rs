@@ -738,7 +738,7 @@ where
     committed
 }
 
-/// Fetch every file in `jobs` into `out`, `parallel` at a time, from `url`
+/// Fetch each file in `jobs` into `out` with parallel ranges from `url`
 /// (a package over http(s), or a container on disk as `file://`).
 ///
 /// The first file that fails stops the rest and is the result. Each file is
@@ -792,7 +792,7 @@ async fn fetch_files_with_old(
         out,
         url,
         key,
-        parallel.unwrap_or(4),
+        parallel.unwrap_or(8),
         |delta| {
             let _ = tx.try_send(ProgressEvent::Advanced { delta });
         },

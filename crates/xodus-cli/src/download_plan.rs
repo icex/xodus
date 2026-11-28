@@ -21,6 +21,7 @@ use std::{
 };
 
 const WINDOW: usize = 8 * 1024 * 1024;
+const CHECKPOINT: u64 = 256 * 1024 * 1024;
 const REQUEST_PAGES: usize = 512;
 const INDEX_LIMIT: usize = 262144;
 pub struct Entry {
@@ -152,6 +153,74 @@ fn fill_local(
     valid
 }
 
+enum Work {
+    /// Authenticated pages already written from the local source.
+    Reused(u64),
+    /// A missing byte range, as offsets within the stored file.
+    Fetch((u64, u64)),
+}
+enum Done {
+    Reused(u64),
+    Fetched(u64, Vec<u8>),
+}
+/// Write every reusable local page in one window and list the ranges that
+/// still have to be fetched.
+fn plan_window(
+    offset: u64,
+    length: u64,
+    source: Option<&File>,
+    current: &SegmentFile,
+    positions: &HashMap<[u8; 20], u64>,
+    output: &File,
+    accepts: impl FnMut(u64, &[u8]) -> bool,
+) -> io::Result<Vec<Work>> {
+    let end = offset.saturating_add(WINDOW as u64).min(length);
+    let size = (end - offset) as usize;
+    let valid = match source {
+        Some(_) => {
+            let mut data = vec![0u8; size];
+            let valid = fill_local(&mut data, offset, source, current, positions, accepts);
+            let mut page = 0;
+            while page < valid.len() {
+                let start = page;
+                while page < valid.len() && valid[page] {
+                    page += 1;
+                }
+                if start == page {
+                    page += 1;
+                    continue;
+                }
+                let bytes = &data[start * PAGE_SIZE..(page * PAGE_SIZE).min(size)];
+                output.write_all_at(bytes, offset + (start * PAGE_SIZE) as u64)?;
+            }
+            valid
+        }
+        None => vec![false; size.div_ceil(PAGE_SIZE)],
+    };
+    // Short authentic islands are fetched again inside a larger range, so
+    // reuse is whatever the window does not request.
+    let fetch: Vec<Work> = gaps(&valid)
+        .into_iter()
+        .map(|range| {
+            let start = offset + (range.start * PAGE_SIZE) as u64;
+            Work::Fetch((start, (offset + (range.end * PAGE_SIZE) as u64).min(length)))
+        })
+        .collect();
+    let fetched: u64 = fetch
+        .iter()
+        .map(|w| match w {
+            Work::Fetch((a, b)) => b - a,
+            Work::Reused(_) => 0,
+        })
+        .sum();
+    let mut work = vec![];
+    if fetched < size as u64 {
+        work.push(Work::Reused(size as u64 - fetched));
+    }
+    work.extend(fetch);
+    Ok(work)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute(
     client: &reqwest::Client,
@@ -236,7 +305,7 @@ async fn one_file(
         .map_err(|e| e.to_string())?
         .len()
         .min(length);
-    let mut offset = tokio::task::block_in_place(|| {
+    let offset = tokio::task::block_in_place(|| {
         verified_prefix(&output, saved, |index, page| {
             xvd.accepts_installed_page(content, index, key, page)
         })
@@ -257,88 +326,95 @@ async fn one_file(
     advanced(offset);
     let source = read_only(&target).map_err(|e| e.to_string())?;
     let positions = old_positions(old);
-    while offset < length {
-        session.ready().await?;
-        let end = offset.saturating_add(WINDOW as u64).min(length);
-        let mut data = vec![0u8; (end - offset) as usize];
-        let valid = tokio::task::block_in_place(|| {
-            fill_local(
-                &mut data,
-                offset,
-                source.as_ref(),
-                content,
-                &positions,
-                |index, page| xvd.accepts_installed_page(content, index, key, page),
-            )
-        });
-        let fetched = stream::iter(gaps(&valid))
-            .map(|range| {
-                let start = offset + range.start as u64 * PAGE_SIZE as u64;
-                let request_end = (offset + range.end as u64 * PAGE_SIZE as u64).min(length);
+    {
+        let (local, index, staging) = (source.as_ref(), &positions, &output);
+        // One continuous pipeline keeps `parallel` ranges in flight across window
+        // boundaries: a slow range never idles the other connections. Windows only
+        // bound how much local data is staged for reuse at once.
+        let pipeline = stream::iter((offset..length).step_by(WINDOW))
+            .then(move |window| async move {
+                session.ready().await?;
+                tokio::task::block_in_place(|| {
+                    plan_window(window, length, local, content, index, staging, |i, p| {
+                        xvd.accepts_installed_page(content, i, key, p)
+                    })
+                })
+                .map_err(|e| e.to_string())
+            })
+            .flat_map(|planned| {
+                stream::iter(match planned {
+                    Ok(work) => work.into_iter().map(Ok).collect(),
+                    Err(error) => vec![Err(error)],
+                })
+            })
+            .map(|work| async move {
+                let (start, request_end) = match work? {
+                    Work::Reused(bytes) => return Ok(Done::Reused(bytes)),
+                    Work::Fetch(range) => range,
+                };
                 let file = SegmentFile {
                     offset: content.offset + start,
                     length: (request_end - start).min(content.length - start.min(content.length)),
                     data_hashs: vec![],
                     keep_encrypted: content.keep_encrypted,
                 };
-                async move {
-                    let downloaded = session
-                        .request(|| async {
-                            let mut bytes = vec![];
-                            if let Some(local) = url.strip_prefix("file://") {
-                                let mut source = tokio::fs::File::open(local)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                                xvd.extract_file(&mut source, &mut bytes, &file, key, |_, _| {})
-                                    .await
-                                    .map_err(|e| {
-                                        format!(
-                                            "{}: {e}; this container does not contain this file",
-                                            entry.name
-                                        )
-                                    })?;
-                            } else {
-                                xvd.download_file_http(
-                                    client,
-                                    url,
-                                    &mut bytes,
-                                    &file,
-                                    key,
-                                    |_, _| {},
-                                )
+                let downloaded = session
+                    .request(|| async {
+                        let mut bytes = vec![];
+                        if let Some(local) = url.strip_prefix("file://") {
+                            let mut source = tokio::fs::File::open(local)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            xvd.extract_file(&mut source, &mut bytes, &file, key, |_, _| {})
+                                .await
+                                .map_err(|e| {
+                                    format!(
+                                        "{}: {e}; this container does not contain this file",
+                                        entry.name
+                                    )
+                                })?;
+                        } else {
+                            xvd.download_file_http(client, url, &mut bytes, &file, key, |_, _| {})
                                 .await
                                 .map_err(|e| format!("{}: {e}", entry.name))?;
-                            }
-                            Ok(bytes)
-                        })
-                        .await?;
-                    if downloaded.len() as u64 != request_end - start {
-                        return Err("Package returned an unexpected amount of output".to_string());
-                    }
-                    Ok((range.start * PAGE_SIZE, downloaded))
+                        }
+                        Ok(bytes)
+                    })
+                    .await?;
+                if downloaded.len() as u64 != request_end - start {
+                    return Err("Package returned an unexpected amount of output".to_string());
                 }
+                Ok(Done::Fetched(start, downloaded))
             })
-            .buffer_unordered(parallel)
-            .collect::<Vec<Result<(usize, Vec<u8>), String>>>()
-            .await;
-        // Settle all HTTP buffers before exposing an error. No background task
-        // retains an installation writer after this function releases it.
-        let mut network = 0u64;
-        for result in fetched {
-            let (start, bytes) = result?;
-            network += bytes.len() as u64;
-            data[start..start + bytes.len()].copy_from_slice(&bytes);
+            .buffer_unordered(parallel);
+        let mut pipeline = std::pin::pin!(pipeline);
+        let mut unsynced = 0u64;
+        // Every write happens on this task, between polls of the pipeline.
+        // Returning early drops in-flight futures, which own only HTTP buffers.
+        while let Some(done) = pipeline.next().await {
+            let written = match done? {
+                Done::Reused(bytes) => {
+                    session.advance(bytes, 0, bytes);
+                    bytes
+                }
+                Done::Fetched(start, bytes) => {
+                    session.ready().await?;
+                    tokio::task::block_in_place(|| staging.write_all_at(&bytes, start))
+                        .map_err(|e| e.to_string())?;
+                    let bytes = bytes.len() as u64;
+                    session.advance(bytes, bytes, 0);
+                    bytes
+                }
+            };
+            advanced(written);
+            // Resume re-verifies every page, so syncing only bounds how much
+            // verified work a power loss can discard; it is not needed for safety.
+            unsynced += written;
+            if unsynced >= CHECKPOINT {
+                tokio::task::block_in_place(|| staging.sync_data()).map_err(|e| e.to_string())?;
+                unsynced = 0;
+            }
         }
-        session.ready().await?;
-        tokio::task::block_in_place(|| {
-            output.write_all_at(&data, offset)?;
-            output.sync_data()
-        })
-        .map_err(|e: io::Error| e.to_string())?;
-        let durable = data.len() as u64;
-        session.advance(durable, network, durable - network);
-        advanced(durable);
-        offset = end;
     }
     output.sync_all().map_err(|e| e.to_string())?;
     drop(output);

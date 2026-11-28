@@ -18,52 +18,49 @@ struct Server {
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
+/// Holds the first range until a request at or past `after` arrives.
+struct Gate {
+    first: usize,
+    after: usize,
+    opened: Mutex<Option<bool>>,
+    changed: std::sync::Condvar,
+}
+impl Gate {
+    fn wait(&self) {
+        let opened = self.opened.lock().unwrap();
+        let (mut opened, timeout) = self
+            .changed
+            .wait_timeout_while(opened, Duration::from_secs(5), |o| o.is_none())
+            .unwrap();
+        if timeout.timed_out() {
+            *opened = Some(false);
+        }
+    }
+    fn saw(&self, start: usize) {
+        if start >= self.after {
+            self.opened.lock().unwrap().get_or_insert(true);
+            self.changed.notify_all();
+        }
+    }
+}
 impl Server {
     fn new(bytes: Vec<u8>, status: u16) -> Self {
+        Self::with_gate(bytes, status, None)
+    }
+    fn with_gate(bytes: Vec<u8>, status: u16, gate: Option<Arc<Gate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let ranges = Arc::new(Mutex::new(vec![]));
         let stop = Arc::new(AtomicBool::new(false));
+        let bytes = Arc::new(bytes);
         let (worker_ranges, worker_stop) = (ranges.clone(), stop.clone());
         let worker = thread::spawn(move || {
             for stream in listener.incoming() {
                 if worker_stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let mut stream = stream.unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut range = None;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                        if let Some((a, b)) = value.trim().split_once('-') {
-                            range =
-                                Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
-                        }
-                    }
-                }
-                if status != 206 {
-                    write!(stream,"HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").ok();
-                    continue;
-                }
-                let Some((a, b)) = range else { continue };
-                worker_ranges.lock().unwrap().push((a, b));
-                if b >= bytes.len() {
-                    write!(
-                        stream,
-                        "HTTP/1.1 416 Range\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                    .ok();
-                    continue;
-                }
-                write!(stream,"HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",b-a+1,bytes.len()).unwrap();
-                stream.write_all(&bytes[a..=b]).ok();
+                let (bytes, ranges, gate) = (bytes.clone(), worker_ranges.clone(), gate.clone());
+                thread::spawn(move || serve(stream.unwrap(), &bytes, status, &ranges, gate));
             }
         });
         Self {
@@ -73,6 +70,56 @@ impl Server {
             worker: Some(worker),
         }
     }
+}
+fn serve(
+    mut stream: TcpStream,
+    bytes: &[u8],
+    status: u16,
+    ranges: &Mutex<Vec<(usize, usize)>>,
+    gate: Option<Arc<Gate>>,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut range = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+            if let Some((a, b)) = value.trim().split_once('-') {
+                range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+            }
+        }
+    }
+    if status != 206 {
+        write!(
+            stream,
+            "HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .ok();
+        return;
+    }
+    let Some((a, b)) = range else { return };
+    ranges.lock().unwrap().push((a, b));
+    if let Some(gate) = gate {
+        gate.saw(a);
+        if a == gate.first {
+            gate.wait();
+        }
+    }
+    if b >= bytes.len() {
+        write!(
+            stream,
+            "HTTP/1.1 416 Range\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .ok();
+        return;
+    }
+    write!(stream,"HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{}\r\nConnection: close\r\n\r\n",b-a+1,bytes.len()).unwrap();
+    stream.write_all(&bytes[a..=b]).ok();
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -123,6 +170,61 @@ async fn fixture(changed: bool) -> (Vec<u8>, XvdFile, Entry, Vec<u8>) {
 }
 fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_range_does_not_stop_later_windows_from_downloading() {
+    // Two full windows and one trailing page.
+    let drive_pages = 2 * WINDOW / PAGE_SIZE + 1;
+    let package = msixvc::xvd::testing::package_with_drive_pages(drive_pages, |_| {});
+    let start = package.drive_page * PAGE_SIZE;
+    let length = drive_pages * PAGE_SIZE;
+    let expected = package.bytes[start..start + length].to_vec();
+    let xvd = XvdFile::parse_verified(&mut std::io::Cursor::new(&package.bytes))
+        .await
+        .unwrap();
+    let gate = Arc::new(Gate {
+        first: start,
+        after: start + WINDOW,
+        opened: Mutex::new(None),
+        changed: std::sync::Condvar::new(),
+    });
+    let server = Server::with_gate(package.bytes, 206, Some(gate.clone()));
+    let root = tempfile::tempdir().unwrap();
+    let entry = Entry {
+        name: "payload.dat".into(),
+        content: SegmentFile {
+            offset: start as u64,
+            length: length as u64,
+            data_hashs: vec![],
+            keep_encrypted: false,
+        },
+    };
+    let mut progress = 0;
+    execute(
+        &client(),
+        &xvd,
+        vec![entry],
+        &HashMap::new(),
+        root.path(),
+        &server.url,
+        [0; 32],
+        8,
+        |n| progress += n,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *gate.opened.lock().unwrap(),
+        Some(true),
+        "The second window must be requested while the first range is still in flight"
+    );
+    assert_eq!(progress, length as u64);
+    assert_eq!(fs::read(root.path().join("payload.dat")).unwrap(), expected);
+    let mut ranges = server.ranges.lock().unwrap();
+    ranges.sort_unstable();
+    let covered: usize = ranges.iter().map(|(a, b)| b - a + 1).sum();
+    assert_eq!(covered, length, "Every byte is requested exactly once");
 }
 
 #[tokio::test(flavor = "multi_thread")]
