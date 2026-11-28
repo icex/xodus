@@ -1694,12 +1694,12 @@ pub mod testing {
             .collect()
     }
 
-    fn header_bytes(top_hash: &[u8; 32]) -> Vec<u8> {
+    fn header_bytes(top_hash: &[u8; 32], drive_pages: usize) -> Vec<u8> {
         let mut h = vec![0u8; 3 * PAGE_SIZE];
         h[0x200..0x208].copy_from_slice(b"msft-xvd");
         // Created in 2019, as a FILETIME.
         h[0x210..0x218].copy_from_slice(&132_000_000_000_000_000i64.to_le_bytes());
-        h[0x218..0x220].copy_from_slice(&((DRIVE_PAGES * PAGE_SIZE) as u64).to_le_bytes());
+        h[0x218..0x220].copy_from_slice(&((drive_pages * PAGE_SIZE) as u64).to_le_bytes());
         h[0x240..0x260].copy_from_slice(top_hash);
         h[0x28C..0x290].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
         h
@@ -1735,9 +1735,16 @@ pub mod testing {
     /// hash tree and header top hash rebuilt to match: what someone able to
     /// rewrite the whole download could serve.
     pub fn package_with(rewrite: impl Fn(&mut [Vec<u8>])) -> Package {
+        package_with_drive_pages(DRIVE_PAGES, rewrite)
+    }
+
+    pub fn package_with_drive_pages(
+        drive_pages: usize,
+        rewrite: impl Fn(&mut [Vec<u8>]),
+    ) -> Package {
         let mut buf = XvdHeader::buffer();
         let len = buf.len();
-        buf.copy_from_slice(&header_bytes(&[0; 32])[..len]);
+        buf.copy_from_slice(&header_bytes(&[0; 32], drive_pages)[..len]);
         let layout = XvdHeader::try_from_array(&buf).unwrap().layout();
         let tree = layout.hash_tree_layout;
         assert_eq!(
@@ -1750,7 +1757,7 @@ pub mod testing {
         let mut user_data = vec![0u8; PAGE_SIZE];
         user_data[8..12].copy_from_slice(&1u32.to_le_bytes());
         let mut data_pages = vec![user_data];
-        data_pages.extend((0..DRIVE_PAGES).map(drive_page_bytes));
+        data_pages.extend((0..drive_pages).map(drive_page_bytes));
         rewrite(&mut data_pages[1..]);
 
         let level0 = level_pages(&data_pages.iter().map(|p| entry(p)).collect::<Vec<_>>());
@@ -1759,7 +1766,7 @@ pub mod testing {
         assert_eq!(level1.len(), 1);
         let top: [u8; 32] = Sha256::digest(&level1[0]).into();
 
-        let mut bytes = header_bytes(&top);
+        let mut bytes = header_bytes(&top, drive_pages);
         let tree_start = layout.hash_tree.start.0 as usize;
         assert_eq!(bytes.len(), tree_start * PAGE_SIZE);
         for page in level1.iter().chain(level0.iter()) {
